@@ -1,8 +1,9 @@
 /*
  * FreeRTOS Kernel <DEVELOPMENT BRANCH>
  * Copyright (C) 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2024 Raspberry Pi (Trading) Ltd.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: MIT AND BSD-3-Clause
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of
  * this software and associated documentation files (the "Software"), to deal in
@@ -26,7 +27,6 @@
  *
  */
 
-
 #ifndef PORTMACRO_H
 #define PORTMACRO_H
 
@@ -35,6 +35,9 @@
     extern "C" {
 #endif
 /* *INDENT-ON* */
+
+#include "pico.h"
+#include "hardware/sync.h"
 
 /*-----------------------------------------------------------
  * Port specific definitions.
@@ -55,8 +58,11 @@
     #define portPOINTER_SIZE_TYPE    uint64_t
 #elif __riscv_xlen == 32
     #define portSTACK_TYPE           uint32_t
-    #define portBASE_TYPE            int32_t
-    #define portUBASE_TYPE           uint32_t
+    // todo amy; these cause compilation failure in the RP2040 FreeRTOS examples; need to go look what the "full" tests do on RISC-V
+    //#define portBASE_TYPE            int32_t
+    //#define portUBASE_TYPE           uint32_t
+    #define portBASE_TYPE            long
+    #define portUBASE_TYPE           unsigned long
     #define portMAX_DELAY            ( TickType_t ) 0xffffffffUL
 #else /* if __riscv_xlen == 64 */
     #error "Assembler did not define __riscv_xlen"
@@ -87,18 +93,58 @@ typedef portUBASE_TYPE   TickType_t;
 #else
     #define portBYTE_ALIGNMENT    16
 #endif
+
+/* Multi-core */
+#define portMAX_CORE_COUNT    2
+
+/* Check validity of number of cores specified in config */
+#if ( configNUMBER_OF_CORES < 1 || portMAX_CORE_COUNT < configNUMBER_OF_CORES )
+#error "Invalid number of cores specified in config!"
+#endif
+
+#if ( configTICK_CORE < 0 || configTICK_CORE > configNUMBER_OF_CORES )
+#error "Invalid tick core specified in config!"
+#endif
+/* FreeRTOS core id is always zero based, so always 0 if we're running on only one core */
+#if configNUMBER_OF_CORES != 1
+#define portGET_CORE_ID()    get_core_num()
+#else
+#define portGET_CORE_ID()    0
+#endif
+
+#define portCHECK_IF_IN_ISR()                                                                     \
+    ( {                                                                                           \
+        uint32_t meicontext;                                                                      \
+        __asm volatile ( "csrr %0, %1" : "=r" ( meicontext ): "i" ( RVCSR_MEICONTEXT_OFFSET ):); \
+        !( meicontext & RVCSR_MEICONTEXT_NOIRQ_BITS ); } )
+
+void vYieldCore( int xCoreID );
+#define portYIELD_CORE( a )                  vYieldCore( a )
+
 /*-----------------------------------------------------------*/
 
 /* Scheduler utilities. */
-extern void vTaskSwitchContext( void );
+#if configNUMBER_OF_CORES == 1
+#define portTASK_SWITCH_CONTEXT() vTaskSwitchContext()
+#else
+#define portTASK_SWITCH_CONTEXT() vTaskSwitchContext(portGET_CORE_ID())
+#endif
+
+#if ( configSUPPORT_PICO_SYNC_INTEROP == 1 )
+/* extra assertion */
+extern void vPortYield(void);
+#define portYIELD()                vPortYield();
+#else
 #define portYIELD()                __asm volatile ( "ecall" );
+#endif /* configSUPPORT_PICO_SYNC_INTEROP */
+
 #define portEND_SWITCHING_ISR( xSwitchRequired ) \
     do                                           \
     {                                            \
         if( xSwitchRequired != pdFALSE )         \
         {                                        \
             traceISR_EXIT_TO_SCHEDULER();        \
-            vTaskSwitchContext();                \
+            portTASK_SWITCH_CONTEXT();           \
         }                                        \
         else                                     \
         {                                        \
@@ -108,13 +154,14 @@ extern void vTaskSwitchContext( void );
 #define portYIELD_FROM_ISR( x )    portEND_SWITCHING_ISR( x )
 /*-----------------------------------------------------------*/
 
-/* Critical section management. */
-#define portCRITICAL_NESTING_IN_TCB    0
+#define portSET_INTERRUPT_MASK()        save_and_disable_interrupts()
+#define portCLEAR_INTERRUPT_MASK(state) restore_interrupts( state )
+#define portDISABLE_INTERRUPTS()        save_and_disable_interrupts()
+#define portENABLE_INTERRUPTS()         restore_interrupts( RVCSR_MIE_MSIE_BITS )
 
-#define portDISABLE_INTERRUPTS()                                   __asm volatile ( "csrc mstatus, 8" )
-#define portENABLE_INTERRUPTS()                                    __asm volatile ( "csrs mstatus, 8" )
-
+#if ( configNUMBER_OF_CORES == 1 )
 extern size_t xCriticalNesting;
+#define portGET_CRITICAL_NESTING_COUNT()          xCriticalNesting
 #define portENTER_CRITICAL()      \
     {                             \
         portDISABLE_INTERRUPTS(); \
@@ -129,12 +176,36 @@ extern size_t xCriticalNesting;
             portENABLE_INTERRUPTS(); \
         }                            \
     }
+#else /* ( configNUMBER_OF_CORES == 1 ) */
+extern size_t xCriticalNestings[ configNUMBER_OF_CORES ];
+/*
+ * SMP enabled
+ */
+extern void vTaskEnterCritical( void );
+extern void vTaskExitCritical( void );
+extern UBaseType_t vTaskEnterCriticalFromISR( void );
+extern void vTaskExitCriticalFromISR( UBaseType_t uxSavedInterruptStatus );
+#define portENTER_CRITICAL()               vTaskEnterCritical()
+#define portEXIT_CRITICAL()                vTaskExitCritical()
+#define portENTER_CRITICAL_FROM_ISR()      vTaskEnterCriticalFromISR()
+#define portEXIT_CRITICAL_FROM_ISR( x )    vTaskExitCriticalFromISR( x )
+
+#define portGET_CRITICAL_NESTING_COUNT()          ( xCriticalNestings[ portGET_CORE_ID() ] )
+#define portSET_CRITICAL_NESTING_COUNT( x )       ( xCriticalNestings[ portGET_CORE_ID() ] = ( x ) )
+#define portINCREMENT_CRITICAL_NESTING_COUNT()    ( xCriticalNestings[ portGET_CORE_ID() ]++ )
+#define portDECREMENT_CRITICAL_NESTING_COUNT()    ( xCriticalNestings[ portGET_CORE_ID() ]-- )
+
+#endif /* if ( configNUMBER_OF_CORES == 1 ) */
+
 
 /*-----------------------------------------------------------*/
 
 /* Architecture specific optimisations. */
 #ifndef configUSE_PORT_OPTIMISED_TASK_SELECTION
-    #define configUSE_PORT_OPTIMISED_TASK_SELECTION    1
+    /* Not supported on SMP */
+    #if ( configNUMBER_OF_CORES == 1 )
+        #define configUSE_PORT_OPTIMISED_TASK_SELECTION    1
+    #endif
 #endif
 
 #if ( configUSE_PORT_OPTIMISED_TASK_SELECTION == 1 )
@@ -175,27 +246,64 @@ extern size_t xCriticalNesting;
 #define portMEMORY_BARRIER()    __asm volatile ( "" ::: "memory" )
 /*-----------------------------------------------------------*/
 
-/* configCLINT_BASE_ADDRESS is a legacy definition that was replaced by the
- * configMTIME_BASE_ADDRESS and configMTIMECMP_BASE_ADDRESS definitions.  For
- * backward compatibility derive the newer definitions from the old if the old
- * definition is found. */
-#if defined( configCLINT_BASE_ADDRESS ) && !defined( configMTIME_BASE_ADDRESS ) && ( configCLINT_BASE_ADDRESS == 0 )
+/* Critical section management. */
 
-/* Legacy case where configCLINT_BASE_ADDRESS was defined as 0 to indicate
- * there was no CLINT.  Equivalent now is to set the MTIME and MTIMECMP
- * addresses to 0. */
-    #define configMTIME_BASE_ADDRESS       ( 0 )
-    #define configMTIMECMP_BASE_ADDRESS    ( 0 )
-#elif defined( configCLINT_BASE_ADDRESS ) && !defined( configMTIME_BASE_ADDRESS )
+#define portCRITICAL_NESTING_IN_TCB    0
 
-/* Legacy case where configCLINT_BASE_ADDRESS was set to the base address of
- * the CLINT.  Equivalent now is to derive the MTIME and MTIMECMP addresses
- * from the CLINT address. */
-    #define configMTIME_BASE_ADDRESS       ( ( configCLINT_BASE_ADDRESS ) + 0xBFF8UL )
-    #define configMTIMECMP_BASE_ADDRESS    ( ( configCLINT_BASE_ADDRESS ) + 0x4000UL )
-#elif !defined( configMTIME_BASE_ADDRESS ) || !defined( configMTIMECMP_BASE_ADDRESS )
-    #error "configMTIME_BASE_ADDRESS and configMTIMECMP_BASE_ADDRESS must be defined in FreeRTOSConfig.h.  Set them to zero if there is no MTIME (machine time) clock.  See www.FreeRTOS.org/Using-FreeRTOS-on-RISC-V.html"
-#endif /* if defined( configCLINT_BASE_ADDRESS ) && !defined( configMTIME_BASE_ADDRESS ) && ( configCLINT_BASE_ADDRESS == 0 ) */
+#define portRTOS_SPINLOCK_COUNT    2
+
+/* Note this is a single method with uxAcquire parameter since we have
+ * static vars, the method is always called with a compile time constant for
+ * uxAcquire, and the compiler should do the right thing! */
+static inline void vPortRecursiveLock( uint32_t ulLockNum,
+                                       spin_lock_t * pxSpinLock,
+                                       BaseType_t uxAcquire )
+{
+    static volatile uint8_t ucOwnedByCore[ portMAX_CORE_COUNT ][portRTOS_SPINLOCK_COUNT];
+    static volatile uint8_t ucRecursionCountByLock[ portRTOS_SPINLOCK_COUNT ];
+
+    configASSERT( ulLockNum < portRTOS_SPINLOCK_COUNT );
+    uint32_t ulCoreNum = get_core_num();
+
+    if( uxAcquire )
+    {
+        if (!spin_try_lock_unsafe(pxSpinLock)) {
+            if( ucOwnedByCore[ ulCoreNum ][ ulLockNum ] )
+            {
+                configASSERT( ucRecursionCountByLock[ ulLockNum ] != 255u );
+                ucRecursionCountByLock[ ulLockNum ]++;
+                return;
+            }
+            spin_lock_unsafe_blocking(pxSpinLock);
+        }
+        configASSERT( ucRecursionCountByLock[ ulLockNum ] == 0 );
+        ucRecursionCountByLock[ ulLockNum ] = 1;
+        ucOwnedByCore[ ulCoreNum ][ ulLockNum ] = 1;
+    }
+    else
+    {
+        configASSERT( ( ucOwnedByCore[ ulCoreNum ] [ulLockNum ] ) != 0 );
+        configASSERT( ucRecursionCountByLock[ ulLockNum ] != 0 );
+
+        if( !--ucRecursionCountByLock[ ulLockNum ] )
+        {
+            ucOwnedByCore[ ulCoreNum ] [ ulLockNum ] = 0;
+            spin_unlock_unsafe(pxSpinLock);
+        }
+    }
+}
+
+#if ( configNUMBER_OF_CORES == 1 )
+    #define portGET_ISR_LOCK()
+    #define portRELEASE_ISR_LOCK()
+    #define portGET_TASK_LOCK()
+    #define portRELEASE_TASK_LOCK()
+#else /* configNUMBER_OF_CORES == 1 */
+    #define portGET_ISR_LOCK()         vPortRecursiveLock( 0, spin_lock_instance( configSMP_SPINLOCK_0 ), pdTRUE )
+    #define portRELEASE_ISR_LOCK()     vPortRecursiveLock( 0, spin_lock_instance( configSMP_SPINLOCK_0 ), pdFALSE )
+    #define portGET_TASK_LOCK()        vPortRecursiveLock( 1, spin_lock_instance( configSMP_SPINLOCK_1 ), pdTRUE )
+    #define portRELEASE_TASK_LOCK()    vPortRecursiveLock( 1, spin_lock_instance( configSMP_SPINLOCK_1 ), pdFALSE )
+#endif /* configNUMBER_OF_CORES == 1 */
 
 /* *INDENT-OFF* */
 #ifdef __cplusplus

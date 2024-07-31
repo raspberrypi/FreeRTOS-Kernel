@@ -35,6 +35,7 @@
 
 /* Portasm includes. */
 #include "portasm.h"
+#include "hardware/address_mapped.h"
 
 /* System call numbers includes. */
 #include "mpu_syscall_numbers.h"
@@ -124,8 +125,15 @@
         (
             "   .syntax unified                                 \n"
             "                                                   \n"
+        #if ( configNUMBER_OF_CORES == 1)
             "   ldr  r2, =pxCurrentTCB                          \n" /* Read the location of pxCurrentTCB i.e. &( pxCurrentTCB ). */
             "   ldr  r1, [r2]                                   \n" /* Read pxCurrentTCB. */
+        #else /* if ( configNUMBER_OF_CORES == 1) */
+            "   adr r1, ulAsmLocals                             \n" /* Get the location of the current TCB for the current core. */
+            "   ldmia r1!, {r2, r3}                             \n"
+            "   ldr r2, [r2]                                    \n" /* r2 = Core number */
+            "   ldr r1, [r3, r2, LSL #2]                        \n" /* r1 = pxCurrentTCBs[get_core_num()] */
+        #endif /* if ( configNUMBER_OF_CORES == 1) */
             "   ldr  r0, [r1]                                   \n" /* Read top of stack from TCB - The first item in pxCurrentTCB is the task top of stack. */
             "                                                   \n"
             "   ldm  r0!, {r1-r2}                               \n" /* Read from stack - r1 = PSPLIM and r2 = EXC_RETURN. */
@@ -138,6 +146,14 @@
             "   mov  r0, #0                                     \n"
             "   msr  basepri, r0                                \n" /* Ensure that interrupts are enabled when the first task starts. */
             "   bx   r2                                         \n" /* Finally, branch to EXC_RETURN. */
+        #if ( configNUMBER_OF_CORES != 1 )
+            "                                                   \n"
+            "     .align 4                                      \n"
+            "ulAsmLocals:                                       \n"
+            "    .word %c0                                      \n" /* SIO */
+            "    .word pxCurrentTCBs                            \n"
+        #endif /* if ( configNUMBER_OF_CORES > 1 ) */
+        :: "i" (SIO_BASE)
         );
     }
 
@@ -197,10 +213,13 @@ void vStartFirstTask( void ) /* __attribute__ (( naked )) PRIVILEGED_FUNCTION */
     (
         "   .syntax unified                                 \n"
         "                                                   \n"
+    /* Note this config is not really supported; it breaks running on core 1 */
+    #if configRESET_STACK_POINTER
         "   ldr r0, =0xe000ed08                             \n" /* Use the NVIC offset register to locate the stack. */
         "   ldr r0, [r0]                                    \n" /* Read the VTOR register which gives the address of vector table. */
         "   ldr r0, [r0]                                    \n" /* The first entry in vector table is stack pointer. */
         "   msr msp, r0                                     \n" /* Set the MSP back to the start of the stack. */
+    #endif
         "   cpsie i                                         \n" /* Globally enable interrupts. */
         "   cpsie f                                         \n"
         "   dsb                                             \n"
@@ -366,34 +385,64 @@ void vClearInterruptMask( __attribute__( ( unused ) ) uint32_t ulMask ) /* __att
         (
             "   .syntax unified                                 \n"
             "                                                   \n"
-            "   mrs r0, psp                                     \n" /* Read PSP in r0. */
+            "   mrs r1, psp                                     \n" /* Read PSP in r1. */
             "                                                   \n"
             #if ( ( configENABLE_FPU == 1 ) || ( configENABLE_MVE == 1 ) )
                 "   tst lr, #0x10                                   \n" /* Test Bit[4] in LR. Bit[4] of EXC_RETURN is 0 if the Extended Stack Frame is in use. */
                 "   it eq                                           \n"
-                "   vstmdbeq r0!, {s16-s31}                         \n" /* Store the additional FP context registers which are not saved automatically. */
+                "   vstmdbeq r1!, {s16-s31}                         \n" /* Store the additional FP context registers which are not saved automatically. */
             #endif /* configENABLE_FPU || configENABLE_MVE */
             "                                                   \n"
             "   mrs r2, psplim                                  \n" /* r2 = PSPLIM. */
             "   mov r3, lr                                      \n" /* r3 = LR/EXC_RETURN. */
-            "   stmdb r0!, {r2-r11}                             \n" /* Store on the stack - PSPLIM, LR and registers that are not automatically saved. */
+            "   stmdb r1!, {r2-r11}                             \n" /* Store on the stack - PSPLIM, LR and registers that are not automatically saved. */
             "                                                   \n"
+            #if portUSE_DCP_SAVE_RESTORE
+            "   mrrc2 p4,#0,r4,r5,c8                            \n" /* PXMD r4, r5 */
+            "   mrrc2 p4,#0,r6,r7,c9                            \n" /* PYMD r6, r7 */
+            "   mrrc2 p4,#0,r8,r9,c10                           \n" /* REFD r8, r9 */
+            "   stmdb r1, {r4-r9}                               \n" /* Store DCP state on the stack; don't update r1 as we want the stack frame to be normal for smart debuggers */
+            #endif /* portUSE_DIVIDER_SAVE_RESTORE */
+
+            #if ( configNUMBER_OF_CORES == 1)
             "   ldr r2, =pxCurrentTCB                           \n" /* Read the location of pxCurrentTCB i.e. &( pxCurrentTCB ). */
-            "   ldr r1, [r2]                                    \n" /* Read pxCurrentTCB. */
-            "   str r0, [r1]                                    \n" /* Save the new top of stack in TCB. */
+            "   ldr r3, [r2]                                    \n" /* Read pxCurrentTCB. */
+            #else /* if ( configNUMBER_OF_CORES == 1) */
+            "   adr r0, ulAsmLocals2                            \n" /* Get the location of the current TCB for the current core. */
+            "   ldmia r0!, {r2, r3}                             \n"
+            "   ldr r0, [r2]                                    \n" /* r0 = Core number */
+            "   ldr r3, [r3, r0, LSL #2]                        \n" /* r3 = pxCurrentTCBs[get_core_num()] */
+            #endif /* if ( configNUMBER_OF_CORES == 1) */
+            "   str r1, [r3]                                    \n" /* Save the new top of stack in TCB. */
             "                                                   \n"
-            "   mov r0, %0                                      \n" /* r0 = configMAX_SYSCALL_INTERRUPT_PRIORITY */
-            "   msr basepri, r0                                 \n" /* Disable interrupts upto configMAX_SYSCALL_INTERRUPT_PRIORITY. */
+            "   mov r1, %0                                      \n" /* r1 = configMAX_SYSCALL_INTERRUPT_PRIORITY */
+            "   msr basepri, r1                                 \n" /* Disable interrupts upto configMAX_SYSCALL_INTERRUPT_PRIORITY. */
             "   dsb                                             \n"
             "   isb                                             \n"
+            /* Note: in configNUMBER_OF_CORES != 1 r0 holds core number from above */
             "   bl vTaskSwitchContext                           \n"
             "   mov r0, #0                                      \n" /* r0 = 0. */
             "   msr basepri, r0                                 \n" /* Enable interrupts. */
             "                                                   \n"
+            #if ( configNUMBER_OF_CORES == 1)
             "   ldr r2, =pxCurrentTCB                           \n" /* Read the location of pxCurrentTCB i.e. &( pxCurrentTCB ). */
             "   ldr r1, [r2]                                    \n" /* Read pxCurrentTCB. */
+            #else /* if ( configNUMBER_OF_CORES == 1) */
+            "   adr r1, ulAsmLocals2                            \n" /* Get the location of the current TCB for the current core. */
+            "   ldmia r1!, {r2, r3}                             \n"
+            "   ldr r2, [r2]                                    \n" /* r2 = Core number */
+            "   ldr r1, [r3, r2, LSL #2]                        \n" /* r1 = pxCurrentTCBs[get_core_num()] */
+            #endif /* if ( configNUMBER_OF_CORES == 1) */
             "   ldr r0, [r1]                                    \n" /* The first item in pxCurrentTCB is the task top of stack. r0 now points to the top of stack. */
             "                                                   \n"
+            #if portUSE_DCP_SAVE_RESTORE
+            "   subs r0, r0, #24                                \n" /* the DCP state is below the stored stack pointer */
+            "   ldmia r0!, {r4-r9}                              \n" /* Read DCP state from stack */
+            "   mcrr p4,#0,r4,r5,c0                             \n" /* WXMD r4, r5 */
+            "   mcrr p4,#0,r6,r7,c1                             \n" /* WYMD r6, r7 */
+            "   mcrr p4,#0,r8,r9,c2                             \n" /* WEFD r8, r9 */
+            #endif /* portUSE_DIVIDER_SAVE_RESTORE */
+
             "   ldmia r0!, {r2-r11}                             \n" /* Read from stack - r2 = PSPLIM, r3 = LR and r4-r11 restored. */
             "                                                   \n"
             #if ( ( configENABLE_FPU == 1 ) || ( configENABLE_MVE == 1 ) )
@@ -405,7 +454,13 @@ void vClearInterruptMask( __attribute__( ( unused ) ) uint32_t ulMask ) /* __att
             "   msr psplim, r2                                  \n" /* Restore the PSPLIM register value for the task. */
             "   msr psp, r0                                     \n" /* Remember the new top of stack for the task. */
             "   bx r3                                           \n"
-            ::"i" ( configMAX_SYSCALL_INTERRUPT_PRIORITY )
+            #if ( configNUMBER_OF_CORES != 1 )
+                "   .align 4                           \n"
+                "ulAsmLocals2:                         \n"
+                "   .word %c1                          \n" /* SIO */
+                "   .word pxCurrentTCBs                \n"
+            #endif /* #if ( configNUMBER_OF_CORES > 1 ) */
+            ::"i" ( configMAX_SYSCALL_INTERRUPT_PRIORITY ), "i" ( SIO_BASE )
         );
     }
 

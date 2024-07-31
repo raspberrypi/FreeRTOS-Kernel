@@ -29,6 +29,18 @@
 #ifndef PORTCONTEXT_H
 #define PORTCONTEXT_H
 
+#include "pico.h"
+#include "hardware/regs/rvcsr.h"
+#include "hardware/regs/intctrl.h"
+
+/*
+ * todo this is currently disabled; as it certainly breaks
+ * the RP2 on_core_zero & on_core_one interrupt tests in FreeRTOS
+ */
+#ifndef portcontextALLOW_NESTED_IRQs
+#define portcontextALLOW_NESTED_IRQs 0
+#endif
+
 #if __riscv_xlen == 64
     #define portWORD_SIZE    8
     #define store_x          sd
@@ -60,13 +72,53 @@
 
 /*-----------------------------------------------------------*/
 
-.extern pxCurrentTCB
-   .extern xISRStackTop
-   .extern xCriticalNesting
-   .extern pxCriticalNesting
+/*
+ * OK this is ugly; we cannot use configNUMBER_OF_CORES because FreeRTOSConfig.h is not required to be ASM includable;
+ * So we have a global pointer that is either to a value 0 for configNUMBER_OF_CORES == 1, or points to the SIO
+ * reg on configNUMBER_OF_CORES == 1
+ */
+.extern pxCurrentCoreID
+/*
+ * Note also we must use our own symbol, because pxCurrentTCB is defined by tasks.c for configNUMBER_OF_CORES == 1
+ * vs pCurrentTCBs for configNUMBER_OF_CORES != 1
+ */
+.extern pxCurrentTCBArray
+.extern xCriticalNestingArray
+
+.extern xISRStackTop
 /*-----------------------------------------------------------*/
 
-   .macro portcontextSAVE_CONTEXT_INTERNAL
+.macro portcontextGET_CORE_ID out_reg
+    load_x \out_reg, pxCurrentCoreID
+    load_x \out_reg, 0 ( \out_reg )
+.endm
+
+.macro portcontextGET_CURRENT_TCB_FOR_CORE core_reg, out_reg
+    /* todo wasteful indirections here because we don't have configNUMBER_OF_CORES */
+    la \out_reg, pxCurrentTCBArray
+    load_x \out_reg, 0 ( \out_reg )
+    sh2add \out_reg, \core_reg, \out_reg
+    load_x \out_reg, 0 ( \out_reg )
+.endm
+
+.macro portcontextGET_CRITICAL_NESTING_PTR_FOR_CORE core_reg, out_reg
+    load_x \out_reg, xCriticalNestingArray
+    sh2add \out_reg, \core_reg, \out_reg
+.endm
+
+.macro portcontextSWITCH_TO_ISR_STACK reg_pISRStackTop, reg_ISRStackTop
+    la \reg_pISRStackTop, SIO_BASE
+    load_x \reg_pISRStackTop, 0 ( \reg_pISRStackTop )
+    la \reg_ISRStackTop, xISRStackTops
+    sh2add \reg_pISRStackTop, \reg_pISRStackTop, \reg_ISRStackTop
+    load_x \reg_ISRStackTop, 0 ( \reg_pISRStackTop )
+    beqz \reg_ISRStackTop, no_isr_stack\@
+    mv sp, \reg_ISRStackTop
+no_isr_stack\@:
+.endm
+/*-----------------------------------------------------------*/
+
+.macro portcontextSAVE_CONTEXT_INTERNAL
 addi sp, sp, -portCONTEXT_SIZE
 store_x x1, 1 * portWORD_SIZE( sp )
 store_x x5, 2 * portWORD_SIZE( sp )
@@ -99,7 +151,9 @@ store_x x15, 12 * portWORD_SIZE( sp )
     store_x x31, 28 * portWORD_SIZE( sp )
 #endif /* ifndef __riscv_32e */
 
-load_x t0, xCriticalNesting                                   /* Load the value of xCriticalNesting into t0. */
+portcontextGET_CORE_ID t1
+portcontextGET_CRITICAL_NESTING_PTR_FOR_CORE t1, t0
+load_x t0, 0 ( t0 )
 store_x t0, portCRITICAL_NESTING_OFFSET * portWORD_SIZE( sp ) /* Store the critical nesting value to the stack. */
 
 
@@ -109,8 +163,9 @@ store_x t0, portMSTATUS_OFFSET * portWORD_SIZE( sp )
 
 portasmSAVE_ADDITIONAL_REGISTERS /* Defined in freertos_risc_v_chip_specific_extensions.h to save any registers unique to the RISC-V implementation. */
 
-load_x t0, pxCurrentTCB          /* Load pxCurrentTCB. */
-store_x sp, 0 ( t0 )             /* Write sp to first TCB member. */
+    portcontextGET_CORE_ID t1
+    portcontextGET_CURRENT_TCB_FOR_CORE t1, t0
+    store_x sp, 0 ( t0 )             /* Write sp to first TCB member. */
 
    .endm
 /*-----------------------------------------------------------*/
@@ -121,7 +176,7 @@ csrr a0, mcause
 csrr a1, mepc
 addi a1, a1, 4          /* Synchronous so update exception return address to the instruction after the instruction that generated the exception. */
 store_x a1, 0 ( sp )    /* Save updated exception return address. */
-load_x sp, xISRStackTop /* Switch to ISR stack. */
+portcontextSWITCH_TO_ISR_STACK t0, t1
    .endm
 /*-----------------------------------------------------------*/
 
@@ -130,12 +185,20 @@ portcontextSAVE_CONTEXT_INTERNAL
 csrr a0, mcause
 csrr a1, mepc
 store_x a1, 0 ( sp )    /* Asynchronous interrupt so save unmodified exception return address. */
-load_x sp, xISRStackTop /* Switch to ISR stack. */
+portcontextSWITCH_TO_ISR_STACK s10, s11
+/*
+ * s10 is now pISRStackTop for the current core
+ * s11 is the old value of ISRStackTop
+ * we expect them to remain saved, and we overwrite the
+ * pISRStackTop with zero, so we don't overwrite again if nesting is enabled
+ */
+    sw zero, 0 (s10)
    .endm
 /*-----------------------------------------------------------*/
 
-   .macro portcontextRESTORE_CONTEXT
-load_x t1, pxCurrentTCB /* Load pxCurrentTCB. */
+.macro portcontextRESTORE_CONTEXT
+portcontextGET_CORE_ID t0
+portcontextGET_CURRENT_TCB_FOR_CORE t0, t1
 load_x sp, 0 ( t1 )     /* Read sp from first TCB member. */
 
 /* Load mepc with the address of the instruction in the task to run next. */
@@ -149,8 +212,11 @@ portasmRESTORE_ADDITIONAL_REGISTERS
 load_x t0, portMSTATUS_OFFSET * portWORD_SIZE( sp )
 csrw mstatus, t0                                             /* Required for MPIE bit. */
 
+/* Load the address of xCriticalNesting into t1. */
+portcontextGET_CORE_ID t0
+portcontextGET_CRITICAL_NESTING_PTR_FOR_CORE t0, t1
+
 load_x t0, portCRITICAL_NESTING_OFFSET * portWORD_SIZE( sp ) /* Obtain xCriticalNesting value for this task from task's stack. */
-load_x t1, pxCriticalNesting                                 /* Load the address of xCriticalNesting into t1. */
 store_x t0, 0 ( t1 )                                         /* Restore the critical nesting value for this task. */
 
 load_x x1, 1 * portWORD_SIZE( sp )
@@ -188,5 +254,11 @@ addi sp, sp, portCONTEXT_SIZE
 mret
    .endm
 /*-----------------------------------------------------------*/
+
+.macro portcontextRESTORE_INTERUUPT_CONTEXT
+    /* restore old ISRStackTop */
+    sw s11, 0 (s10)
+    portcontextRESTORE_CONTEXT
+.endm
 
 #endif /* PORTCONTEXT_H */

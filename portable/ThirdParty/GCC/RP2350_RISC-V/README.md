@@ -1,6 +1,6 @@
 ## Overview
 
-This directory provides an SMP FreeRTOS-Kernel port that can be used with the Raspberry Pi Pico SDK on RP2040. It supports:
+This directory provides an SMP FreeRTOS-Kernel port that can be used with the Raspberry Pi Pico SDK on RP2350. It supports:
 
  * Simple CMake INTERFACE libraries, to provide the FreeRTOS-Kernel and also the individual allocator types, without copying code into the user's project.
  * Running the FreeRTOS-Kernel and tasks on either core 0 or core 1, or both.
@@ -32,7 +32,29 @@ the same placement restrictions related to the Raspberry Pi Pico SDK version abo
 ```cmake
 add_subdirectory(path/to/this/directory FreeRTOS-Kernel)
 ```
+## FreeRTOS configuration for Armv8-M
 
+The following standard FreeRTOS ARM options are required for RP2350"
+
+These three options must be specified as follows, as only RP2040-like FreeRTOS implementation only is supported currently; running in at a single privilege level in the secure statea.
+
+```c
+#define configENABLE_MPU                        0
+#define configENABLE_TRUSTZONE                  0
+#define configRUN_FREERTOS_SECURE_ONLY          1
+```
+
+You can set the following to enable save/restore of FPU state (you should set this is you are using floating point operations)
+
+```c
+#define configENABLE_FPU                        1
+```
+
+As of right now this is the only value of configMAX_SYSCALL_INTERRUPT_PRIORITY that has been tested
+
+```c
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY    16
+```
 
 ## Advanced Configuration
 
@@ -40,4 +62,4 @@ Some additional `config` options are defined [here](include/rp2040_config.h) whi
 
 ## Known Limitations
 
-- Tickless idle has not currently been tested, and is likely non-functional
+- Hazard3 IRQ premption is not currently supported on either core even if only one core is running FreeRTOS

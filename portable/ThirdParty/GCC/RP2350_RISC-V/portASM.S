@@ -230,9 +230,9 @@ chip_specific_stack_frame:              /* First add any chip specific registers
 /*-----------------------------------------------------------*/
 
 xPortStartFirstTask:
-    load_x  sp, pxCurrentTCB            /* Load pxCurrentTCB. */
+    portcontextGET_CORE_ID x7
+    portcontextGET_CURRENT_TCB_FOR_CORE x7, sp
     load_x  sp, 0( sp )                 /* Read sp from first TCB member. */
-
     load_x  x1, 0( sp ) /* Note for starting the scheduler the exception return address is used as the function return address. */
 
     portasmRESTORE_ADDITIONAL_REGISTERS /* Defined in freertos_risc_v_chip_specific_extensions.h to restore any registers unique to the RISC-V implementation. */
@@ -265,8 +265,11 @@ xPortStartFirstTask:
     load_x  x31, 28 * portWORD_SIZE( sp )   /* t6 */
 #endif
 
+    /* Load the address of xCriticalNesting into x6. */
+    portcontextGET_CORE_ID x5
+    portcontextGET_CRITICAL_NESTING_PTR_FOR_CORE x5, x6
+
     load_x  x5, portCRITICAL_NESTING_OFFSET * portWORD_SIZE( sp )    /* Obtain xCriticalNesting value for this task from task's stack. */
-    load_x  x6, pxCriticalNesting           /* Load the address of xCriticalNesting into x6. */
     store_x x5, 0( x6 )                     /* Restore the critical nesting value for this task. */
 
     load_x  x5, portMSTATUS_OFFSET * portWORD_SIZE( sp )    /* Initial mstatus into x5 (t0). */
@@ -300,6 +303,9 @@ freertos_risc_v_exception_handler:
     /* a0 now contains mcause. */
     li t0, 11                           /* 11 == environment call. */
     bne a0, t0, other_exception         /* Not an M environment call, so some other exception. */
+#if configNUMBER_OF_CORES != 1
+    portcontextGET_CORE_ID a0
+#endif
     call vTaskSwitchContext
     portcontextRESTORE_CONTEXT
 
@@ -308,25 +314,90 @@ other_exception:
     portcontextRESTORE_CONTEXT
 /*-----------------------------------------------------------*/
 
-.section .text.freertos_risc_v_interrupt_handler
+
+.section .time_critical.freertos_risc_v_interrupt_handler
 freertos_risc_v_interrupt_handler:
-    portcontextSAVE_INTERRUPT_CONTEXT
-    call freertos_risc_v_application_interrupt_handler
-    portcontextRESTORE_CONTEXT
+    portcontextSAVE_INTERRUPT_CONTEXT // note this macro requires s10, s11 to be preserved here
+    // note we replace/recreate the SDK's IRQ mechansim here, since we want to control the exception stacking
+save_meicontext:
+    // Make sure to set meicontext.clearts to clear+save mie.msie/mtie along
+    // with ext IRQ context. We don't let these preempt ext IRQs because they
+    // clear meicontext.mreteirq, which breaks __get_current_exception().
+    csrrsi s2, RVCSR_MEICONTEXT_OFFSET, RVCSR_MEICONTEXT_CLEARTS_BITS
+
+get_first_irq:
+    // Sample the current highest-priority active IRQ (left-shifted by 2) from
+    // meinext, and write 1 to meinext.update to update meicontext with the
+    // preemption priority and IRQ number of this IRQ
+    csrrsi a0, RVCSR_MEINEXT_OFFSET, RVCSR_MEINEXT_UPDATE_BITS
+    // MSB will be set if there is no active IRQ at the current priority level
+    bltz a0, no_more_irqs
+dispatch_irq:
+#if portcontextALLOW_NESTED_IRQs
+    // Preemption priority was configured by meinext update, so enable preemption:
+    csrsi mstatus, 0x8
+#endif
+    // <- from this point we can be preempted by a higher-priority interrupt.
+    // meinext is pre-shifted by 2, so only an add is required to index table
+    lui a1, %hi(__soft_vector_table)
+    add a1, a1, a0
+    lw a1, %lo(__soft_vector_table)(a1)
+    jalr ra, a1
+    // note: beware: freertos_risc_v_mtimer_interrupt_handler trashes s0 and s1, but
+    // we require s2, s10, s11 saved.
+
+#if portcontextALLOW_NESTED_IRQs
+    // Disable IRQs on returning so we can sample the next IRQ
+    csrci mstatus, 0x8
+#endif
+get_next_irq:
+    // Get the next-highest-priority IRQ that is active at this level. If
+    // there is such an IRQ, update meicontext with new preemption priority.
+    csrrsi a0, RVCSR_MEINEXT_OFFSET, RVCSR_MEINEXT_UPDATE_BITS
+    // MSB will be set if there is no active IRQ at the current priority level
+    bgez a0, dispatch_irq
+
+no_more_irqs:
+    csrw RVCSR_MEICONTEXT_OFFSET, s2
+    portcontextRESTORE_INTERUUPT_CONTEXT
 /*-----------------------------------------------------------*/
 
-.section .text.freertos_risc_v_mtimer_interrupt_handler
+.section .time_critical.freertos_risc_v_mtimer_interrupt_handler
 freertos_risc_v_mtimer_interrupt_handler:
-    portcontextSAVE_INTERRUPT_CONTEXT
+    // we know we are called from freertos_risc_v_interrupt_handler which saves ALL registers
+    // already, and doesn't care about us trashing s0, so we used it instead of stack
+    // to save ra across the calls in this function
+
+    mv   s0, ra
+
+    // Clear the interrupt force array bit for the timer IRQ, in case this IRQ
+    // was forced locally rather than actually coming from the timer.
+    //li   a0, (1 << ((SIO_IRQ_MTIMECMP % 16) + 16) | (SIO_IRQ_MTIMECMP / 16)
+    //csrc 0xbe2, a0 // 0xbe2: meifa (external interrupt force array)
+    // TODO Graham: the above code is probably unnecessary because the meifa
+    // bit should already have been cleared when we sampled the timer IRQ
+    // from meinext. Suggest to delete it once confirmed to work without.
+
     portUPDATE_MTIMER_COMPARE_REGISTER
+
+    call callTaskEnterCriticalFromISR
+
+    // we are also allowed to trash s1 by the caller
+    mv s1, a0
     call xTaskIncrementTick
+    mv a0, s1
+    call callTaskExitCriticalFromISR
     beqz a0, exit_without_context_switch    /* Don't switch context if incrementing tick didn't unblock a task. */
+
+#if configNUMBER_OF_CORES != 1
+    portcontextGET_CORE_ID a0 // vtTaskSwitch context takes coreID in SMP
+#endif
     call vTaskSwitchContext
 exit_without_context_switch:
-    portcontextRESTORE_CONTEXT
+    jr s0
 /*-----------------------------------------------------------*/
 
-.section .text.freertos_risc_v_trap_handler
+.section .time_critical.freertos_risc_v_trap_handler
 .align 8
 freertos_risc_v_trap_handler:
     portcontextSAVE_CONTEXT_INTERNAL
@@ -338,13 +409,13 @@ freertos_risc_v_trap_handler:
 
 asynchronous_interrupt:
     store_x a1, 0( sp )                 /* Asynchronous interrupt so save unmodified exception return address. */
-    load_x sp, xISRStackTop             /* Switch to ISR stack. */
+    portcontextSWITCH_TO_ISR_STACK t0, t1
     j handle_interrupt
 
 synchronous_exception:
     addi a1, a1, 4                      /* Synchronous so update exception return address to the instruction after the instruction that generated the exeption. */
     store_x a1, 0( sp )                 /* Save updated exception return address. */
-    load_x sp, xISRStackTop             /* Switch to ISR stack. */
+    portcontextSWITCH_TO_ISR_STACK t0, t1
     j handle_exception
 
 handle_interrupt:
@@ -359,6 +430,9 @@ handle_interrupt:
         portUPDATE_MTIMER_COMPARE_REGISTER
         call xTaskIncrementTick
         beqz a0, processed_source       /* Don't switch context if incrementing tick didn't unblock a task. */
+#if configNUMBER_OF_CORES != 1
+        portcontextGET_CORE_ID a0
+#endif
         call vTaskSwitchContext
         j processed_source
 
@@ -372,6 +446,9 @@ handle_exception:
     /* a0 contains mcause. */
     li t0, 11                                   /* 11 == environment call. */
     bne a0, t0, application_exception_handler   /* Not an M environment call, so some other exception. */
+#if configNUMBER_OF_CORES != 1
+    portcontextGET_CORE_ID a0
+#endif
     call vTaskSwitchContext
     j processed_source
 

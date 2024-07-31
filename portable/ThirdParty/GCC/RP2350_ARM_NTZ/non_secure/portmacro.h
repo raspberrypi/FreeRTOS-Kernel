@@ -1,8 +1,9 @@
 /*
  * FreeRTOS Kernel <DEVELOPMENT BRANCH>
  * Copyright (C) 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2024 Raspberry Pi (Trading) Ltd.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: MIT AND BSD-3-Clause
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of
  * this software and associated documentation files (the "Software"), to deal in
@@ -35,7 +36,10 @@
 #endif
 /* *INDENT-ON* */
 
-/*------------------------------------------------------------------------------
+#include "pico.h"
+#include "hardware/sync.h"
+
+/*-----------------------------------------------------------
  * Port specific definitions.
  *
  * The settings in this file configure FreeRTOS correctly for the given hardware
@@ -68,9 +72,154 @@
 /**
  * @brief Critical section management.
  */
-#define portDISABLE_INTERRUPTS()    ulSetInterruptMask()
-#define portENABLE_INTERRUPTS()     vClearInterruptMask( 0 )
+#define portSET_INTERRUPT_MASK()        ulSetInterruptMask()
+#define portCLEAR_INTERRUPT_MASK(state) vClearInterruptMask( state )
+#define portDISABLE_INTERRUPTS()        portSET_INTERRUPT_MASK()
+#define portENABLE_INTERRUPTS()         portCLEAR_INTERRUPT_MASK( 0 )
+
+#if ( configNUMBER_OF_CORES == 1 )
+    #define portSET_INTERRUPT_MASK_FROM_ISR()         ulSetInterruptMask()
+    #define portCLEAR_INTERRUPT_MASK_FROM_ISR( x )    vClearInterruptMask( x )
+    #define portENTER_CRITICAL()                      vPortEnterCritical()
+    #define portEXIT_CRITICAL()                       vPortExitCritical()
+#else /* ( configNUMBER_OF_CORES == 1 ) */
+    /* SMP enabled */
+    #undef portENTER_CRITICAL
+    #undef portEXIT_CRITICAL
+
+    extern void vTaskEnterCritical( void );
+    extern void vTaskExitCritical( void );
+    extern UBaseType_t vTaskEnterCriticalFromISR( void );
+    extern void vTaskExitCriticalFromISR( UBaseType_t uxSavedInterruptStatus );
+
+    #define portENTER_CRITICAL()               vTaskEnterCritical()
+    #define portEXIT_CRITICAL()                vTaskExitCritical()
+    #define portENTER_CRITICAL_FROM_ISR()      vTaskEnterCriticalFromISR()
+    #define portEXIT_CRITICAL_FROM_ISR( x )    vTaskExitCriticalFromISR( x )
+#endif /* if ( configNUMBER_OF_CORES != 1 ) */
+
 /*-----------------------------------------------------------*/
+
+#ifdef configUSE_DCP_SAVE_RESTORE
+#define portUSE_DCP_SAVE_RESTORE configUSE_DCP_SAVE_RESTORE
+#elif (LIB_PICO_DOUBLE_PICO/* || LIB_PICO_FLOAT_PICO*/) // todo we don't use DCP in float yet
+#define portUSE_DCP_SAVE_RESTORE 1
+#endif
+
+#if portUSE_DCP_SAVE_RESTORE
+#define portSTACK_LIMIT_PADDING 6
+#endif
+
+/*-----------------------------------------------------------*/
+
+/* Exception handlers */
+#if ( configUSE_DYNAMIC_EXCEPTION_HANDLERS == 0 )
+/* We only need to override the SDK's weak functions if we want to replace them at compile time */
+#define SVC_Handler        isr_svcall
+#define PendSV_Handler     isr_pendsv
+#define SysTick_Handler    isr_systick
+#endif
+
+/*-----------------------------------------------------------*/
+
+/* Multi-core */
+#define portMAX_CORE_COUNT    2
+
+/* Check validity of number of cores specified in config */
+#if ( configNUMBER_OF_CORES < 1 || portMAX_CORE_COUNT < configNUMBER_OF_CORES )
+#error "Invalid number of cores specified in config!"
+#endif
+
+#if ( configTICK_CORE < 0 || configTICK_CORE > configNUMBER_OF_CORES )
+#error "Invalid tick core specified in config!"
+#endif
+/* FreeRTOS core id is always zero based, so always 0 if we're running on only one core */
+#if configNUMBER_OF_CORES != 1
+#define portGET_CORE_ID()    get_core_num()
+#else
+#define portGET_CORE_ID()    0
+#endif
+
+#define portCHECK_IF_IN_ISR()                                 \
+    ( {                                                       \
+        uint32_t ulIPSR;                                      \
+        __asm volatile ( "mrs %0, IPSR" : "=r" ( ulIPSR )::); \
+        ( ( uint8_t ) ulIPSR ) > 0; } )
+
+void vYieldCore( int xCoreID );
+#define portYIELD_CORE( a )                  vYieldCore( a )
+
+/*-----------------------------------------------------------*/
+
+/* Critical nesting count management. */
+#if configNUMBER_OF_CORES == 1
+#define portGET_CRITICAL_NESTING_COUNT()          ulCriticalNesting
+#else
+extern volatile uint32_t ulCriticalNestings[ configNUMBER_OF_CORES ];
+#define portGET_CRITICAL_NESTING_COUNT()          ( ulCriticalNestings[ portGET_CORE_ID() ] )
+#define portSET_CRITICAL_NESTING_COUNT( x )       ( ulCriticalNestings[ portGET_CORE_ID() ] = ( x ) )
+#define portINCREMENT_CRITICAL_NESTING_COUNT()    ( ulCriticalNestings[ portGET_CORE_ID() ]++ )
+#define portDECREMENT_CRITICAL_NESTING_COUNT()    ( ulCriticalNestings[ portGET_CORE_ID() ]-- )
+#endif
+/*-----------------------------------------------------------*/
+
+/* Critical section management. */
+#define portCRITICAL_NESTING_IN_TCB    0
+
+#define portRTOS_SPINLOCK_COUNT    2
+
+/* Note this is a single method with uxAcquire parameter since we have
+ * static vars, the method is always called with a compile time constant for
+ * uxAcquire, and the compiler should dothe right thing! */
+static inline void vPortRecursiveLock( uint32_t ulLockNum,
+                                       spin_lock_t * pxSpinLock,
+                                       BaseType_t uxAcquire )
+{
+    static volatile uint8_t ucOwnedByCore[ portMAX_CORE_COUNT ][portRTOS_SPINLOCK_COUNT];
+    static volatile uint8_t ucRecursionCountByLock[ portRTOS_SPINLOCK_COUNT ];
+
+    configASSERT( ulLockNum < portRTOS_SPINLOCK_COUNT );
+    uint32_t ulCoreNum = get_core_num();
+
+    if( uxAcquire )
+    {
+        if (!spin_try_lock_unsafe(pxSpinLock)) {
+            if( ucOwnedByCore[ ulCoreNum ][ ulLockNum ] )
+            {
+                configASSERT( ucRecursionCountByLock[ ulLockNum ] != 255u );
+                ucRecursionCountByLock[ ulLockNum ]++;
+                return;
+            }
+            spin_lock_unsafe_blocking(pxSpinLock);
+        }
+        configASSERT( ucRecursionCountByLock[ ulLockNum ] == 0 );
+        ucRecursionCountByLock[ ulLockNum ] = 1;
+        ucOwnedByCore[ ulCoreNum ][ ulLockNum ] = 1;
+    }
+    else
+    {
+        configASSERT( ( ucOwnedByCore[ ulCoreNum ] [ulLockNum ] ) != 0 );
+        configASSERT( ucRecursionCountByLock[ ulLockNum ] != 0 );
+
+        if( !--ucRecursionCountByLock[ ulLockNum ] )
+        {
+            ucOwnedByCore[ ulCoreNum ] [ ulLockNum ] = 0;
+            spin_unlock_unsafe(pxSpinLock);
+        }
+    }
+}
+
+#if ( configNUMBER_OF_CORES == 1 )
+    #define portGET_ISR_LOCK()
+    #define portRELEASE_ISR_LOCK()
+    #define portGET_TASK_LOCK()
+    #define portRELEASE_TASK_LOCK()
+#else /* configNUMBER_OF_CORES == 1 */
+    #define portGET_ISR_LOCK()         vPortRecursiveLock( 0, spin_lock_instance( configSMP_SPINLOCK_0 ), pdTRUE )
+    #define portRELEASE_ISR_LOCK()     vPortRecursiveLock( 0, spin_lock_instance( configSMP_SPINLOCK_0 ), pdFALSE )
+    #define portGET_TASK_LOCK()        vPortRecursiveLock( 1, spin_lock_instance( configSMP_SPINLOCK_1 ), pdTRUE )
+    #define portRELEASE_TASK_LOCK()    vPortRecursiveLock( 1, spin_lock_instance( configSMP_SPINLOCK_1 ), pdFALSE )
+#endif /* configNUMBER_OF_CORES == 1 */
 
 /* *INDENT-OFF* */
 #ifdef __cplusplus

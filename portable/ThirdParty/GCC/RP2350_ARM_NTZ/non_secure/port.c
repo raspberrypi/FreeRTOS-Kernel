@@ -1,8 +1,9 @@
 /*
  * FreeRTOS Kernel <DEVELOPMENT BRANCH>
  * Copyright (C) 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2024 Raspberry Pi (Trading) Ltd.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: MIT AND BSD-3-Clause
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of
  * this software and associated documentation files (the "Software"), to deal in
@@ -34,6 +35,9 @@
 /* Scheduler includes. */
 #include "FreeRTOS.h"
 #include "task.h"
+#include "rp2040_config.h"
+#include "hardware/clocks.h"
+#include "hardware/exception.h"
 
 /* MPU includes. */
 #include "mpu_wrappers.h"
@@ -47,6 +51,15 @@
     #include "secure_context.h"
     #include "secure_init.h"
 #endif /* configENABLE_TRUSTZONE */
+
+/*
+ * LIB_PICO_MULTICORE == 1, if we are linked with pico_multicore (note that
+ * the non SMP FreeRTOS_Kernel is not linked with pico_multicore itself). We
+ * use this flag to determine if we need multi-core functionality.
+ */
+#if ( LIB_PICO_MULTICORE == 1 )
+#include "pico/multicore.h"
+#endif /* LIB_PICO_MULTICORE */
 
 #undef MPU_WRAPPERS_INCLUDED_FROM_API_FILE
 
@@ -375,6 +388,23 @@ typedef void ( * portISR_t )( void );
 #define portNO_SECURE_CONTEXT    0
 /*-----------------------------------------------------------*/
 
+#if ( configSUPPORT_PICO_SYNC_INTEROP == 1 || configNUMBER_OF_CORES > 1 )
+    #include "hardware/irq.h"
+#endif /* ( configSUPPORT_PICO_SYNC_INTEROP == 1 || configNUMBER_OF_CORES > 1 ) */
+#if ( configSUPPORT_PICO_SYNC_INTEROP == 1 )
+    #include "pico/lock_core.h"
+    #include "event_groups.h"
+    #if configSUPPORT_STATIC_ALLOCATION
+        static StaticEventGroup_t xStaticEventGroup;
+        #define pEventGroup    ( &xStaticEventGroup )
+    #endif /* configSUPPORT_STATIC_ALLOCATION */
+    static EventGroupHandle_t xEventGroup;
+    #if ( configNUMBER_OF_CORES == 1 )
+        static EventBits_t uxCrossCoreEventBits;
+        static spin_lock_t * pxCrossCoreSpinLock; /* protects uxCrossCoreEventBits */
+    #endif
+#endif /* configSUPPORT_PICO_SYNC_INTEROP */
+
 /**
  * @brief Used to catch tasks that attempt to return from their implementing
  * function.
@@ -511,12 +541,6 @@ portDONT_DISCARD void vPortSVCHandler_C( uint32_t * pulCallerStackAddress ) PRIV
 
 #endif /* ( configENABLE_MPU == 1 ) && ( configUSE_MPU_WRAPPERS_V1 == 0 ) */
 
-/**
- * @brief Each task maintains its own interrupt status in the critical nesting
- * variable.
- */
-PRIVILEGED_DATA static volatile uint32_t ulCriticalNesting = 0xaaaaaaaaUL;
-
 #if ( configENABLE_TRUSTZONE == 1 )
 
 /**
@@ -558,8 +582,20 @@ PRIVILEGED_DATA static volatile uint32_t ulCriticalNesting = 0xaaaaaaaaUL;
  */
     PRIVILEGED_DATA static uint32_t ulStoppedTimerCompensation = 0;
 #endif /* configUSE_TICKLESS_IDLE */
-/*-----------------------------------------------------------*/
 
+void vPortSetupTimerInterrupt( void ) __attribute__( ( weak ) );
+
+/*-----------------------------------------------------------*/
+/**
+ * @brief Each task maintains its own interrupt status in the critical nesting
+ * variable.
+ */
+#if ( configNUMBER_OF_CORES == 1 )
+PRIVILEGED_DATA static volatile uint32_t ulCriticalNesting = 0xaaaaaaaaUL;
+#else /* #if ( configNUMBER_OF_CORES == 1 ) */
+PRIVILEGED_DATA volatile uint32_t ulCriticalNestings[ configNUMBER_OF_CORES ] = { 0 };
+
+#endif /* #if ( configNUMBER_OF_CORES == 1 ) */
 #if ( configUSE_TICKLESS_IDLE == 1 )
 
     __attribute__( ( weak ) ) void vPortSuppressTicksAndSleep( TickType_t xExpectedIdleTime )
@@ -781,6 +817,19 @@ PRIVILEGED_DATA static volatile uint32_t ulCriticalNesting = 0xaaaaaaaaUL;
 #endif /* configUSE_TICKLESS_IDLE */
 /*-----------------------------------------------------------*/
 
+#define INVALID_PRIMARY_CORE_NUM    0xffu
+/* The primary core number (the own which has the SysTick handler) */
+static uint8_t ucPrimaryCoreNum = INVALID_PRIMARY_CORE_NUM;
+/* Initialize to -1 so that when using INTEROP with SDK and running on one core only, we can tell if this is initialized yet */
+static int8_t cDoorbellNum = -1;
+
+/* Note: portIS_FREE_RTOS_CORE() also returns false until the scheduler is started */
+#if ( configNUMBER_OF_CORES != 1 )
+    #define portIS_FREE_RTOS_CORE()    ( ucPrimaryCoreNum != INVALID_PRIMARY_CORE_NUM )
+#else
+    #define portIS_FREE_RTOS_CORE()    ( ucPrimaryCoreNum == get_core_num() )
+#endif
+
 __attribute__( ( weak ) ) void vPortSetupTimerInterrupt( void ) /* PRIVILEGED_FUNCTION */
 {
     /* Calculate the constants required to configure the tick interrupt. */
@@ -804,7 +853,7 @@ __attribute__( ( weak ) ) void vPortSetupTimerInterrupt( void ) /* PRIVILEGED_FU
     portNVIC_SYSTICK_CURRENT_VALUE_REG = 0UL;
 
     /* Configure SysTick to interrupt at the requested rate. */
-    portNVIC_SYSTICK_LOAD_REG = ( configSYSTICK_CLOCK_HZ / configTICK_RATE_HZ ) - 1UL;
+    portNVIC_SYSTICK_LOAD_REG = ( clock_get_hz( clk_sys ) / configTICK_RATE_HZ ) - 1UL;
     portNVIC_SYSTICK_CTRL_REG = portNVIC_SYSTICK_CLK_BIT_CONFIG | portNVIC_SYSTICK_INT_BIT | portNVIC_SYSTICK_ENABLE_BIT;
 }
 /*-----------------------------------------------------------*/
@@ -818,7 +867,7 @@ static void prvTaskExitError( void )
      * should instead call vTaskDelete( NULL ). Artificially force an assert()
      * to be triggered if configASSERT() is defined, then stop here so
      * application writers can catch the error. */
-    configASSERT( ulCriticalNesting == ~0UL );
+    configASSERT( portGET_CRITICAL_NESTING_COUNT() == ~0UL );
     portDISABLE_INTERRUPTS();
 
     while( ulDummy == 0 )
@@ -992,7 +1041,11 @@ void vPortYield( void ) /* PRIVILEGED_FUNCTION */
 void vPortEnterCritical( void ) /* PRIVILEGED_FUNCTION */
 {
     portDISABLE_INTERRUPTS();
+#if configNUMBER_OF_CORES == 1
     ulCriticalNesting++;
+#else
+    ulCriticalNestings[portGET_CORE_ID()]++;
+#endif
 
     /* Barriers are normally not required but do ensure the code is
      * completely within the specified behaviour for the architecture. */
@@ -1003,6 +1056,7 @@ void vPortEnterCritical( void ) /* PRIVILEGED_FUNCTION */
 
 void vPortExitCritical( void ) /* PRIVILEGED_FUNCTION */
 {
+#if configNUMBER_OF_CORES == 1
     configASSERT( ulCriticalNesting );
     ulCriticalNesting--;
 
@@ -1010,14 +1064,24 @@ void vPortExitCritical( void ) /* PRIVILEGED_FUNCTION */
     {
         portENABLE_INTERRUPTS();
     }
+#else
+    uint32_t ulCoreId = portGET_CORE_ID();
+    configASSERT( ulCriticalNestings[ulCoreId] );
+    ulCriticalNestings[ulCoreId]--;
+    if( ulCriticalNestings[ulCoreId] == 0 )
+    {
+        portENABLE_INTERRUPTS();
+    }
+#endif
 }
+
 /*-----------------------------------------------------------*/
 
 void SysTick_Handler( void ) /* PRIVILEGED_FUNCTION */
 {
     uint32_t ulPreviousMask;
 
-    ulPreviousMask = portSET_INTERRUPT_MASK_FROM_ISR();
+    ulPreviousMask = taskENTER_CRITICAL_FROM_ISR();
     traceISR_ENTER();
     {
         /* Increment the RTOS tick. */
@@ -1032,8 +1096,10 @@ void SysTick_Handler( void ) /* PRIVILEGED_FUNCTION */
             traceISR_EXIT();
         }
     }
-    portCLEAR_INTERRUPT_MASK_FROM_ISR( ulPreviousMask );
+    taskEXIT_CRITICAL_FROM_ISR( ulPreviousMask );
 }
+
+
 /*-----------------------------------------------------------*/
 
 void vPortSVCHandler_C( uint32_t * pulCallerStackAddress ) /* PRIVILEGED_FUNCTION portDONT_DISCARD */
@@ -1624,164 +1690,410 @@ void vPortSVCHandler_C( uint32_t * pulCallerStackAddress ) /* PRIVILEGED_FUNCTIO
 #endif /* configENABLE_MPU */
 /*-----------------------------------------------------------*/
 
-BaseType_t xPortStartScheduler( void ) /* PRIVILEGED_FUNCTION */
-{
-    /* An application can install FreeRTOS interrupt handlers in one of the
-     * following ways:
-     * 1. Direct Routing - Install the functions SVC_Handler and PendSV_Handler
-     *    for SVCall and PendSV interrupts respectively.
-     * 2. Indirect Routing - Install separate handlers for SVCall and PendSV
-     *    interrupts and route program control from those handlers to
-     *    SVC_Handler and PendSV_Handler functions.
-     *
-     * Applications that use Indirect Routing must set
-     * configCHECK_HANDLER_INSTALLATION to 0 in their FreeRTOSConfig.h. Direct
-     * routing, which is validated here when configCHECK_HANDLER_INSTALLATION
-     * is 1, should be preferred when possible. */
-    #if ( configCHECK_HANDLER_INSTALLATION == 1 )
+#if ( LIB_PICO_MULTICORE == 1 ) && ( configSUPPORT_PICO_SYNC_INTEROP == 1 || configNUMBER_OF_CORES > 1)
+    static void prvDoorbellInterruptHandler()
     {
-        const portISR_t * const pxVectorTable = portSCB_VTOR_REG;
-
-        /* Validate that the application has correctly installed the FreeRTOS
-         * handlers for SVCall and PendSV interrupts. We do not check the
-         * installation of the SysTick handler because the application may
-         * choose to drive the RTOS tick using a timer other than the SysTick
-         * timer by overriding the weak function vPortSetupTimerInterrupt().
-         *
-         * Assertion failures here indicate incorrect installation of the
-         * FreeRTOS handlers. For help installing the FreeRTOS handlers, see
-         * https://www.FreeRTOS.org/FAQHelp.html.
-         *
-         * Systems with a configurable address for the interrupt vector table
-         * can also encounter assertion failures or even system faults here if
-         * VTOR is not set correctly to point to the application's vector table. */
-        configASSERT( pxVectorTable[ portVECTOR_INDEX_SVC ] == SVC_Handler );
-        configASSERT( pxVectorTable[ portVECTOR_INDEX_PENDSV ] == PendSV_Handler );
-    }
-    #endif /* configCHECK_HANDLER_INSTALLATION */
-
-    #if ( ( configASSERT_DEFINED == 1 ) && ( portHAS_ARMV8M_MAIN_EXTENSION == 1 ) )
-    {
-        volatile uint32_t ulImplementedPrioBits = 0;
-        volatile uint8_t ucMaxPriorityValue;
-
-        /* Determine the maximum priority from which ISR safe FreeRTOS API
-         * functions can be called. ISR safe functions are those that end in
-         * "FromISR". FreeRTOS maintains separate thread and ISR API functions to
-         * ensure interrupt entry is as fast and simple as possible.
-         *
-         * First, determine the number of priority bits available. Write to all
-         * possible bits in the priority setting for SVCall. */
-        portNVIC_SHPR2_REG = 0xFF000000;
-
-        /* Read the value back to see how many bits stuck. */
-        ucMaxPriorityValue = ( uint8_t ) ( ( portNVIC_SHPR2_REG & 0xFF000000 ) >> 24 );
-
-        /* Use the same mask on the maximum system call priority. */
-        ucMaxSysCallPriority = configMAX_SYSCALL_INTERRUPT_PRIORITY & ucMaxPriorityValue;
-
-        /* Check that the maximum system call priority is nonzero after
-         * accounting for the number of priority bits supported by the
-         * hardware. A priority of 0 is invalid because setting the BASEPRI
-         * register to 0 unmasks all interrupts, and interrupts with priority 0
-         * cannot be masked using BASEPRI.
-         * See https://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html */
-        configASSERT( ucMaxSysCallPriority );
-
-        /* Check that the bits not implemented in hardware are zero in
-         * configMAX_SYSCALL_INTERRUPT_PRIORITY. */
-        configASSERT( ( configMAX_SYSCALL_INTERRUPT_PRIORITY & ( uint8_t ) ( ~( uint32_t ) ucMaxPriorityValue ) ) == 0U );
-
-        /* Calculate the maximum acceptable priority group value for the number
-         * of bits read back. */
-        while( ( ucMaxPriorityValue & portTOP_BIT_OF_BYTE ) == portTOP_BIT_OF_BYTE )
+        if (cDoorbellNum >= 0 && multicore_doorbell_is_set_current_core(cDoorbellNum))
         {
-            ulImplementedPrioBits++;
-            ucMaxPriorityValue <<= ( uint8_t ) 0x01;
+            multicore_doorbell_clear_current_core(cDoorbellNum);
+            #if ( configNUMBER_OF_CORES != 1 )
+                portYIELD_FROM_ISR( pdTRUE );
+            #elif ( configSUPPORT_PICO_SYNC_INTEROP == 1 )
+                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                uint32_t ulSave = spin_lock_blocking( pxCrossCoreSpinLock );
+                EventBits_t ulBits = uxCrossCoreEventBits;
+                uxCrossCoreEventBits = 0;
+                spin_unlock( pxCrossCoreSpinLock, ulSave );
+                xEventGroupSetBitsFromISR( xEventGroup, ulBits, &xHigherPriorityTaskWoken );
+                portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+            #endif /* configNUMBER_OF_CORES != 1 */
         }
+    }
+#endif /* ( LIB_PICO_MULTICORE == 1 ) && ( configSUPPORT_PICO_SYNC_INTEROP == 1 || configNUMBER_OF_CORES > 1) */
 
-        if( ulImplementedPrioBits == 8 )
+#if ( configNUMBER_OF_CORES > 1 )
+    static BaseType_t xPortStartSchedulerOnCore( void ) /* PRIVILEGED_FUNCTION */
+    {
+        /* An application can install FreeRTOS interrupt handlers in one of the
+         * following ways:
+         * 1. Direct Routing - Install the functions SVC_Handler and PendSV_Handler
+         *    for SVCall and PendSV interrupts respectively.
+         * 2. Indirect Routing - Install separate handlers for SVCall and PendSV
+         *    interrupts and route program control from those handlers to
+         *    SVC_Handler and PendSV_Handler functions.
+         *
+         * Applications that use Indirect Routing must set
+         * configCHECK_HANDLER_INSTALLATION to 0 in their FreeRTOSConfig.h. Direct
+         * routing, which is validated here when configCHECK_HANDLER_INSTALLATION
+         * is 1, should be preferred when possible. */
+        #if ( configCHECK_HANDLER_INSTALLATION == 1 && configUSE_DYNAMIC_EXCEPTION_HANDLERS == 0)
         {
-            /* When the hardware implements 8 priority bits, there is no way for
-             * the software to configure PRIGROUP to not have sub-priorities. As
-             * a result, the least significant bit is always used for sub-priority
-             * and there are 128 preemption priorities and 2 sub-priorities.
+            const portISR_t * const pxVectorTable = portSCB_VTOR_REG;
+
+            /* Validate that the application has correctly installed the FreeRTOS
+             * handlers for SVCall and PendSV interrupts. We do not check the
+             * installation of the SysTick handler because the application may
+             * choose to drive the RTOS tick using a timer other than the SysTick
+             * timer by overriding the weak function vPortSetupTimerInterrupt().
              *
-             * This may cause some confusion in some cases - for example, if
-             * configMAX_SYSCALL_INTERRUPT_PRIORITY is set to 5, both 5 and 4
-             * priority interrupts will be masked in Critical Sections as those
-             * are at the same preemption priority. This may appear confusing as
-             * 4 is higher (numerically lower) priority than
-             * configMAX_SYSCALL_INTERRUPT_PRIORITY and therefore, should not
-             * have been masked. Instead, if we set configMAX_SYSCALL_INTERRUPT_PRIORITY
-             * to 4, this confusion does not happen and the behaviour remains the same.
+             * Assertion failures here indicate incorrect installation of the
+             * FreeRTOS handlers. For help installing the FreeRTOS handlers, see
+             * https://www.FreeRTOS.org/FAQHelp.html.
              *
-             * The following assert ensures that the sub-priority bit in the
-             * configMAX_SYSCALL_INTERRUPT_PRIORITY is clear to avoid the above mentioned
-             * confusion. */
-            configASSERT( ( configMAX_SYSCALL_INTERRUPT_PRIORITY & 0x1U ) == 0U );
-            ulMaxPRIGROUPValue = 0;
+             * Systems with a configurable address for the interrupt vector table
+             * can also encounter assertion failures or even system faults here if
+             * VTOR is not set correctly to point to the application's vector table. */
+            configASSERT( pxVectorTable[ portVECTOR_INDEX_SVC ] == SVC_Handler );
+            configASSERT( pxVectorTable[ portVECTOR_INDEX_PENDSV ] == PendSV_Handler );
         }
-        else
+        #endif /* configCHECK_HANDLER_INSTALLATION */
+
+        #if ( ( configASSERT_DEFINED == 1 ) && ( portHAS_ARMV8M_MAIN_EXTENSION == 1 ) )
         {
-            ulMaxPRIGROUPValue = portMAX_PRIGROUP_BITS - ulImplementedPrioBits;
+            volatile uint32_t ulImplementedPrioBits = 0;
+            volatile uint8_t ucMaxPriorityValue;
+
+            /* Determine the maximum priority from which ISR safe FreeRTOS API
+             * functions can be called. ISR safe functions are those that end in
+             * "FromISR". FreeRTOS maintains separate thread and ISR API functions to
+             * ensure interrupt entry is as fast and simple as possible.
+             *
+             * First, determine the number of priority bits available. Write to all
+             * possible bits in the priority setting for SVCall. */
+            portNVIC_SHPR2_REG = 0xFF000000;
+
+            /* Read the value back to see how many bits stuck. */
+            ucMaxPriorityValue = ( uint8_t ) ( ( portNVIC_SHPR2_REG & 0xFF000000 ) >> 24 );
+
+            /* Use the same mask on the maximum system call priority. */
+            ucMaxSysCallPriority = configMAX_SYSCALL_INTERRUPT_PRIORITY & ucMaxPriorityValue;
+
+            /* Check that the maximum system call priority is nonzero after
+             * accounting for the number of priority bits supported by the
+             * hardware. A priority of 0 is invalid because setting the BASEPRI
+             * register to 0 unmasks all interrupts, and interrupts with priority 0
+             * cannot be masked using BASEPRI.
+             * See https://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html */
+            configASSERT( ucMaxSysCallPriority );
+
+            /* Check that the bits not implemented in hardware are zero in
+             * configMAX_SYSCALL_INTERRUPT_PRIORITY. */
+            configASSERT( ( configMAX_SYSCALL_INTERRUPT_PRIORITY & ( uint8_t ) ( ~( uint32_t ) ucMaxPriorityValue ) ) == 0U );
+
+            /* Calculate the maximum acceptable priority group value for the number
+             * of bits read back. */
+            while( ( ucMaxPriorityValue & portTOP_BIT_OF_BYTE ) == portTOP_BIT_OF_BYTE )
+            {
+                ulImplementedPrioBits++;
+                ucMaxPriorityValue <<= ( uint8_t ) 0x01;
+            }
+
+            if( ulImplementedPrioBits == 8 )
+            {
+                /* When the hardware implements 8 priority bits, there is no way for
+                 * the software to configure PRIGROUP to not have sub-priorities. As
+                 * a result, the least significant bit is always used for sub-priority
+                 * and there are 128 preemption priorities and 2 sub-priorities.
+                 *
+                 * This may cause some confusion in some cases - for example, if
+                 * configMAX_SYSCALL_INTERRUPT_PRIORITY is set to 5, both 5 and 4
+                 * priority interrupts will be masked in Critical Sections as those
+                 * are at the same preemption priority. This may appear confusing as
+                 * 4 is higher (numerically lower) priority than
+                 * configMAX_SYSCALL_INTERRUPT_PRIORITY and therefore, should not
+                 * have been masked. Instead, if we set configMAX_SYSCALL_INTERRUPT_PRIORITY
+                 * to 4, this confusion does not happen and the behaviour remains the same.
+                 *
+                 * The following assert ensures that the sub-priority bit in the
+                 * configMAX_SYSCALL_INTERRUPT_PRIORITY is clear to avoid the above mentioned
+                 * confusion. */
+                configASSERT( ( configMAX_SYSCALL_INTERRUPT_PRIORITY & 0x1U ) == 0U );
+                ulMaxPRIGROUPValue = 0;
+            }
+            else
+            {
+                ulMaxPRIGROUPValue = portMAX_PRIGROUP_BITS - ulImplementedPrioBits;
+            }
+
+            /* Shift the priority group value back to its position within the AIRCR
+             * register. */
+            ulMaxPRIGROUPValue <<= portPRIGROUP_SHIFT;
+            ulMaxPRIGROUPValue &= portPRIORITY_GROUP_MASK;
         }
+        #endif /* #if ( ( configASSERT_DEFINED == 1 ) && ( portHAS_ARMV8M_MAIN_EXTENSION == 1 ) ) */
 
-        /* Shift the priority group value back to its position within the AIRCR
-         * register. */
-        ulMaxPRIGROUPValue <<= portPRIGROUP_SHIFT;
-        ulMaxPRIGROUPValue &= portPRIORITY_GROUP_MASK;
+        #if ( configENABLE_MPU == 1 )
+        {
+            /* Setup the Memory Protection Unit (MPU). */
+            prvSetupMPU();
+        }
+        #endif /* configENABLE_MPU */
+
+        if( ucPrimaryCoreNum == get_core_num() )
+        {
+            /* Start the timer that generates the tick ISR.  Interrupts are disabled
+             * here already. */
+            vPortSetupTimerInterrupt();
+
+            /* Make PendSV and SysTick the lowest priority interrupts, and make SVCall
+             * the highest priority. */
+            portNVIC_SHPR3_REG |= portNVIC_SYSTICK_PRI;
+            #if ( configUSE_DYNAMIC_EXCEPTION_HANDLERS == 1 )
+                exception_set_exclusive_handler( SYSTICK_EXCEPTION, SysTick_Handler );
+            #endif
+        }
+        /* Make PendSV and SysTick the lowest priority interrupts, and make SVCall
+         * the highest priority. */
+        portNVIC_SHPR3_REG |= portNVIC_PENDSV_PRI;
+        portNVIC_SHPR2_REG = 0;
+
+        #if ( configUSE_DYNAMIC_EXCEPTION_HANDLERS == 1 )
+        exception_set_exclusive_handler( PENDSV_EXCEPTION, PendSV_Handler );
+        exception_set_exclusive_handler( SVCALL_EXCEPTION, SVC_Handler );
+        #endif
+
+        /* Initialize the critical nesting count ready for the first task. */
+        ulCriticalNestings[portGET_CORE_ID()] = 0;
+
+        /* Install Doorbell handler to receive interrupt from other core */
+        uint32_t irq_num = multicore_doorbell_irq_num(cDoorbellNum);
+        irq_set_priority( irq_num, portMIN_INTERRUPT_PRIORITY );
+        irq_set_exclusive_handler( irq_num, prvDoorbellInterruptHandler );
+        irq_set_enabled( irq_num, 1 );
+
+        #if ( ( configENABLE_MPU == 1 ) && ( configUSE_MPU_WRAPPERS_V1 == 0 ) )
+        {
+            xSchedulerRunning = pdTRUE;
+        }
+        #endif /* ( ( configENABLE_MPU == 1 ) && ( configUSE_MPU_WRAPPERS_V1 == 0 ) ) */
+
+        /* Start the first task. */
+        vStartFirstTask();
+
+        /* Should never get here as the tasks will now be executing. Call the task
+         * exit error function to prevent compiler warnings about a static function
+         * not being called in the case that the application writer overrides this
+         * functionality by defining configTASK_RETURN_ADDRESS. Call
+         * vTaskSwitchContext() so link time optimization does not remove the
+         * symbol. */
+        vTaskSwitchContext( portGET_CORE_ID() );
+        prvTaskExitError();
+
+        /* Should not get here. */
+        return 0;
     }
-    #endif /* #if ( ( configASSERT_DEFINED == 1 ) && ( portHAS_ARMV8M_MAIN_EXTENSION == 1 ) ) */
 
-    /* Make PendSV and SysTick the lowest priority interrupts, and make SVCall
-     * the highest priority. */
-    portNVIC_SHPR3_REG |= portNVIC_PENDSV_PRI;
-    portNVIC_SHPR3_REG |= portNVIC_SYSTICK_PRI;
-    portNVIC_SHPR2_REG = 0;
-
-    #if ( configENABLE_MPU == 1 )
+    static void prvDisableInterruptsAndPortStartSchedulerOnCore( void )
     {
-        /* Setup the Memory Protection Unit (MPU). */
-        prvSetupMPU();
+        portDISABLE_INTERRUPTS();
+        xPortStartSchedulerOnCore();
     }
-    #endif /* configENABLE_MPU */
 
-    /* Start the timer that generates the tick ISR. Interrupts are disabled
-     * here already. */
-    vPortSetupTimerInterrupt();
-
-    /* Initialize the critical nesting count ready for the first task. */
-    ulCriticalNesting = 0;
-
-    #if ( ( configENABLE_MPU == 1 ) && ( configUSE_MPU_WRAPPERS_V1 == 0 ) )
+    BaseType_t xPortStartScheduler( void )
     {
-        xSchedulerRunning = pdTRUE;
+        configASSERT( ucPrimaryCoreNum == INVALID_PRIMARY_CORE_NUM );
+
+        /* No one else should use these! */
+        spin_lock_claim( configSMP_SPINLOCK_0 );
+        spin_lock_claim( configSMP_SPINLOCK_1 );
+
+        // claim same number of both cores for simplicity
+        cDoorbellNum = (int8_t)multicore_doorbell_claim_unused(0b11, true);
+        multicore_doorbell_clear_current_core(cDoorbellNum);
+        multicore_doorbell_clear_other_core(cDoorbellNum);
+
+        ucPrimaryCoreNum = configTICK_CORE;
+        configASSERT( get_core_num() == 0 ); /* we must be started on core 0 */
+        multicore_launch_core1( prvDisableInterruptsAndPortStartSchedulerOnCore );
+        xPortStartSchedulerOnCore();
+
+        /* Should not get here! */
+        return 0;
     }
-    #endif /* ( ( configENABLE_MPU == 1 ) && ( configUSE_MPU_WRAPPERS_V1 == 0 ) ) */
 
-    /* Start the first task. */
-    vStartFirstTask();
+#else /* if ( configNUMBER_OF_CORES != 1 ) */
+    BaseType_t xPortStartScheduler( void ) /* PRIVILEGED_FUNCTION */
+    {
+        /* An application can install FreeRTOS interrupt handlers in one of the
+         * following ways:
+         * 1. Direct Routing - Install the functions SVC_Handler and PendSV_Handler
+         *    for SVCall and PendSV interrupts respectively.
+         * 2. Indirect Routing - Install separate handlers for SVCall and PendSV
+         *    interrupts and route program control from those handlers to
+         *    SVC_Handler and PendSV_Handler functions.
+         *
+         * Applications that use Indirect Routing must set
+         * configCHECK_HANDLER_INSTALLATION to 0 in their FreeRTOSConfig.h. Direct
+         * routing, which is validated here when configCHECK_HANDLER_INSTALLATION
+         * is 1, should be preferred when possible. */
+        #if ( configCHECK_HANDLER_INSTALLATION == 1 && configUSE_DYNAMIC_EXCEPTION_HANDLERS == 0)
+        {
+            const portISR_t * const pxVectorTable = portSCB_VTOR_REG;
 
-    /* Should never get here as the tasks will now be executing. Call the task
-     * exit error function to prevent compiler warnings about a static function
-     * not being called in the case that the application writer overrides this
-     * functionality by defining configTASK_RETURN_ADDRESS. Call
-     * vTaskSwitchContext() so link time optimization does not remove the
-     * symbol. */
-    vTaskSwitchContext();
-    prvTaskExitError();
+            /* Validate that the application has correctly installed the FreeRTOS
+             * handlers for SVCall and PendSV interrupts. We do not check the
+             * installation of the SysTick handler because the application may
+             * choose to drive the RTOS tick using a timer other than the SysTick
+             * timer by overriding the weak function vPortSetupTimerInterrupt().
+             *
+             * Assertion failures here indicate incorrect installation of the
+             * FreeRTOS handlers. For help installing the FreeRTOS handlers, see
+             * https://www.FreeRTOS.org/FAQHelp.html.
+             *
+             * Systems with a configurable address for the interrupt vector table
+             * can also encounter assertion failures or even system faults here if
+             * VTOR is not set correctly to point to the application's vector table. */
+            configASSERT( pxVectorTable[ portVECTOR_INDEX_SVC ] == SVC_Handler );
+            configASSERT( pxVectorTable[ portVECTOR_INDEX_PENDSV ] == PendSV_Handler );
+        }
+        #endif /* configCHECK_HANDLER_INSTALLATION */
 
-    /* Should not get here. */
-    return 0;
-}
+        #if ( ( configASSERT_DEFINED == 1 ) && ( portHAS_ARMV8M_MAIN_EXTENSION == 1 ) )
+        {
+            volatile uint32_t ulImplementedPrioBits = 0;
+            volatile uint8_t ucMaxPriorityValue;
+
+            /* Determine the maximum priority from which ISR safe FreeRTOS API
+             * functions can be called. ISR safe functions are those that end in
+             * "FromISR". FreeRTOS maintains separate thread and ISR API functions to
+             * ensure interrupt entry is as fast and simple as possible.
+             *
+             * First, determine the number of priority bits available. Write to all
+             * possible bits in the priority setting for SVCall. */
+            portNVIC_SHPR2_REG = 0xFF000000;
+
+            /* Read the value back to see how many bits stuck. */
+            ucMaxPriorityValue = ( uint8_t ) ( ( portNVIC_SHPR2_REG & 0xFF000000 ) >> 24 );
+
+            /* Use the same mask on the maximum system call priority. */
+            ucMaxSysCallPriority = configMAX_SYSCALL_INTERRUPT_PRIORITY & ucMaxPriorityValue;
+
+            /* Check that the maximum system call priority is nonzero after
+             * accounting for the number of priority bits supported by the
+             * hardware. A priority of 0 is invalid because setting the BASEPRI
+             * register to 0 unmasks all interrupts, and interrupts with priority 0
+             * cannot be masked using BASEPRI.
+             * See https://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html */
+            configASSERT( ucMaxSysCallPriority );
+
+            /* Check that the bits not implemented in hardware are zero in
+             * configMAX_SYSCALL_INTERRUPT_PRIORITY. */
+            configASSERT( ( configMAX_SYSCALL_INTERRUPT_PRIORITY & ( uint8_t ) ( ~( uint32_t ) ucMaxPriorityValue ) ) == 0U );
+
+            /* Calculate the maximum acceptable priority group value for the number
+             * of bits read back. */
+            while( ( ucMaxPriorityValue & portTOP_BIT_OF_BYTE ) == portTOP_BIT_OF_BYTE )
+            {
+                ulImplementedPrioBits++;
+                ucMaxPriorityValue <<= ( uint8_t ) 0x01;
+            }
+
+            if( ulImplementedPrioBits == 8 )
+            {
+                /* When the hardware implements 8 priority bits, there is no way for
+                 * the software to configure PRIGROUP to not have sub-priorities. As
+                 * a result, the least significant bit is always used for sub-priority
+                 * and there are 128 preemption priorities and 2 sub-priorities.
+                 *
+                 * This may cause some confusion in some cases - for example, if
+                 * configMAX_SYSCALL_INTERRUPT_PRIORITY is set to 5, both 5 and 4
+                 * priority interrupts will be masked in Critical Sections as those
+                 * are at the same preemption priority. This may appear confusing as
+                 * 4 is higher (numerically lower) priority than
+                 * configMAX_SYSCALL_INTERRUPT_PRIORITY and therefore, should not
+                 * have been masked. Instead, if we set configMAX_SYSCALL_INTERRUPT_PRIORITY
+                 * to 4, this confusion does not happen and the behaviour remains the same.
+                 *
+                 * The following assert ensures that the sub-priority bit in the
+                 * configMAX_SYSCALL_INTERRUPT_PRIORITY is clear to avoid the above mentioned
+                 * confusion. */
+                configASSERT( ( configMAX_SYSCALL_INTERRUPT_PRIORITY & 0x1U ) == 0U );
+                ulMaxPRIGROUPValue = 0;
+            }
+            else
+            {
+                ulMaxPRIGROUPValue = portMAX_PRIGROUP_BITS - ulImplementedPrioBits;
+            }
+
+            /* Shift the priority group value back to its position within the AIRCR
+             * register. */
+            ulMaxPRIGROUPValue <<= portPRIGROUP_SHIFT;
+            ulMaxPRIGROUPValue &= portPRIORITY_GROUP_MASK;
+        }
+        #endif /* #if ( ( configASSERT_DEFINED == 1 ) && ( portHAS_ARMV8M_MAIN_EXTENSION == 1 ) ) */
+
+        /* Make PendSV and SysTick the lowest priority interrupts, and make SVCall
+         * the highest priority. */
+        portNVIC_SHPR3_REG |= portNVIC_PENDSV_PRI;
+        portNVIC_SHPR3_REG |= portNVIC_SYSTICK_PRI;
+        portNVIC_SHPR2_REG = 0;
+
+        #if ( configENABLE_MPU == 1 )
+        {
+            /* Setup the Memory Protection Unit (MPU). */
+            prvSetupMPU();
+        }
+        #endif /* configENABLE_MPU */
+
+        #if ( configUSE_DYNAMIC_EXCEPTION_HANDLERS == 1 )
+        {
+            exception_set_exclusive_handler(PENDSV_EXCEPTION, PendSV_Handler);
+            exception_set_exclusive_handler(SYSTICK_EXCEPTION, SysTick_Handler);
+            exception_set_exclusive_handler(SVCALL_EXCEPTION, SVC_Handler);
+        }
+        #endif
+
+
+        /* Start the timer that generates the tick ISR. Interrupts are disabled
+         * here already. */
+        vPortSetupTimerInterrupt();
+
+        /* Initialize the critical nesting count ready for the first task. */
+        ulCriticalNesting = 0;
+
+        #if ( ( configENABLE_MPU == 1 ) && ( configUSE_MPU_WRAPPERS_V1 == 0 ) )
+        {
+            xSchedulerRunning = pdTRUE;
+        }
+        #endif /* ( ( configENABLE_MPU == 1 ) && ( configUSE_MPU_WRAPPERS_V1 == 0 ) ) */
+
+        ucPrimaryCoreNum = get_core_num();
+        #if ( LIB_PICO_MULTICORE == 1 )
+            #if ( configSUPPORT_PICO_SYNC_INTEROP == 1 )
+                // claim same number of both cores for simplicity
+                cDoorbellNum = (int8_t) multicore_doorbell_claim_unused(0b11, true);
+                multicore_doorbell_clear_current_core(cDoorbellNum);
+                multicore_doorbell_clear_other_core(cDoorbellNum);
+                uint32_t irq_num = multicore_doorbell_irq_num(cDoorbellNum);
+                irq_set_priority( irq_num, portMIN_INTERRUPT_PRIORITY );
+                irq_set_exclusive_handler( irq_num, prvDoorbellInterruptHandler );
+                irq_set_enabled( irq_num, 1 );
+            #endif
+        #endif
+
+        /* Start the first task. */
+        vStartFirstTask();
+
+        /* Should never get here as the tasks will now be executing. Call the task
+         * exit error function to prevent compiler warnings about a static function
+         * not being called in the case that the application writer overrides this
+         * functionality by defining configTASK_RETURN_ADDRESS. Call
+         * vTaskSwitchContext() so link time optimization does not remove the
+         * symbol. */
+        vTaskSwitchContext();
+        prvTaskExitError();
+
+        /* Should not get here. */
+        return 0;
+    }
+#endif /* if ( configNUMBER_OF_CORES > 1 ) */
 /*-----------------------------------------------------------*/
 
 void vPortEndScheduler( void ) /* PRIVILEGED_FUNCTION */
 {
     /* Not implemented in ports where there is nothing to return to.
      * Artificially force an assert. */
-    configASSERT( ulCriticalNesting == 1000UL );
+    configASSERT( portGET_CORE_ID() == 1000UL );
 }
 /*-----------------------------------------------------------*/
 
@@ -2157,4 +2469,275 @@ BaseType_t xPortIsInsideInterrupt( void )
     #endif /* #if ( configENABLE_ACCESS_CONTROL_LIST == 1 ) */
 
 #endif /* #if ( ( configENABLE_MPU == 1 ) && ( configUSE_MPU_WRAPPERS_V1 == 0 ) ) */
+/*-----------------------------------------------------------*/
+#if ( configSUPPORT_PICO_SYNC_INTEROP == 1 ) || ( configSUPPORT_PICO_TIME_INTEROP == 1 )
+    static TickType_t prvGetTicksToWaitBefore( absolute_time_t t )
+    {
+        int64_t xDelay = absolute_time_diff_us( get_absolute_time(), t );
+        const uint32_t ulTickPeriod = 1000000 / configTICK_RATE_HZ;
+
+        xDelay += ulTickPeriod - 1;
+
+        if( xDelay >= ulTickPeriod )
+        {
+            return xDelay / ulTickPeriod;
+        }
+
+        return 0;
+    }
+#endif /* if ( configSUPPORT_PICO_SYNC_INTEROP == 1 ) || ( configSUPPORT_PICO_TIME_INTEROP == 1 ) */
+
+#if ( configSUPPORT_PICO_SYNC_INTEROP == 1 )
+    uint32_t ulPortLockGetCurrentOwnerId()
+    {
+        if( portIS_FREE_RTOS_CORE() )
+        {
+            uint32_t exception = __get_current_exception();
+
+            if( !exception )
+            {
+                return ( uintptr_t ) xTaskGetCurrentTaskHandle();
+            }
+
+            /* Note: since ROM as at 0x00000000, these can't be confused with
+             * valid task handles (pointers) in RAM */
+            /* We make all exception handler/core combinations distinct owners */
+            return get_core_num() + exception * 2;
+        }
+
+        /* Note: since ROM as at 0x00000000, this can't be confused with
+         * valid task handles (pointers) in RAM */
+        return get_core_num();
+    }
+
+    static inline EventBits_t prvGetEventGroupBit( spin_lock_t * spinLock )
+    {
+        uint32_t ulBit;
+
+        #if ( configTICK_TYPE_WIDTH_IN_BITS == TICK_TYPE_WIDTH_16_BITS )
+            ulBit = 1u << ( spin_lock_get_num( spinLock ) & 0x7u );
+        #elif ( configTICK_TYPE_WIDTH_IN_BITS == TICK_TYPE_WIDTH_32_BITS )
+            ulBit = 1u << ( spin_lock_get_num( spinLock ) % 24 );
+        #endif /* configTICK_TYPE_WIDTH_IN_BITS */
+        return ( EventBits_t ) ulBit;
+    }
+
+    static inline EventBits_t prvGetAllEventGroupBits()
+    {
+        #if ( configTICK_TYPE_WIDTH_IN_BITS == TICK_TYPE_WIDTH_16_BITS )
+            return ( EventBits_t ) 0xffu;
+        #elif ( configTICK_TYPE_WIDTH_IN_BITS == TICK_TYPE_WIDTH_32_BITS )
+            return ( EventBits_t ) 0xffffffu;
+        #endif /* configTICK_TYPE_WIDTH_IN_BITS */
+    }
+
+    void vPortLockInternalSpinUnlockWithWait( struct lock_core * pxLock,
+                                              uint32_t ulSave )
+    {
+        configASSERT( !portCHECK_IF_IN_ISR() );
+        configASSERT( pxLock->spin_lock );
+
+        if( !portIS_FREE_RTOS_CORE() )
+        {
+            spin_unlock( pxLock->spin_lock, ulSave );
+            __wfe();
+        }
+        else
+        {
+            /* The requirement (from the SDK) on this implementation is that this method
+             * should always wake up from a corresponding call to vPortLockInternalSpinUnlockWithNotify
+             * that happens after this method is called.
+             *
+             * The moment that we unlock the spin lock, we need to be sure that
+             * there is no way that we end up blocking in xEventGroupWaitBits,
+             * despite the fact that other tasks can now run, if the corresponding
+             * unlock has occurred.
+             *
+             * Previously the RP2xxx ports used to attempt to disable IRQs until the
+             * task actually (potentially) became blocked by hooking the IRQ re-enable
+             * when xEventGroupWaitBits completes (or switches tasks), but this
+             * was a broken hack, in that IRQs are re-enabled at other points during
+             * that call.
+             *
+             * This deferred IRQ enable is not actually needed, because all we
+             * care about is that:
+             *
+             * Even in the presence of other tasks acquiring then releasing
+             * the lock, between the interrupt_enable and the xEventGroupWaitBits,
+             * the corresponding bit will still be set.
+             *
+             * This is the case, even any intervening blocked lock (which
+             * clears the event bit) will need to unlock it before we proceed,
+             * which will set the event bit again.
+             *
+             * The multiplexing down of multiple spin lock numbers to fewer
+             * event bits does not cause a possible race condition,
+             * but it does mean that a task waiting for lock A can be
+             * blocked by a task B which owns another lock.
+             *
+             * This could be fixed by using an array of event groups, however
+             * since the SDK spin locks are generally intended for very short
+             * term usage anyway, and rarely nested except in exotic cases
+             * like video output, we'll leave it as one event group for now
+             */
+            spin_unlock( pxLock->spin_lock, ulSave);
+            xEventGroupWaitBits( xEventGroup, prvGetEventGroupBit( pxLock->spin_lock ),
+                                 pdTRUE, pdFALSE, portMAX_DELAY );
+        }
+    }
+
+    void vPortLockInternalSpinUnlockWithNotify( struct lock_core * pxLock,
+                                                uint32_t ulSave )
+    {
+        EventBits_t uxBits = prvGetEventGroupBit( pxLock->spin_lock );
+
+        if( portIS_FREE_RTOS_CORE() )
+        {
+            #if LIB_PICO_MULTICORE
+                /* signal an event in case a regular core is waiting */
+                __sev();
+            #endif
+            spin_unlock( pxLock->spin_lock, ulSave );
+
+            if( !portCHECK_IF_IN_ISR() )
+            {
+                xEventGroupSetBits( xEventGroup, uxBits );
+            }
+            else
+            {
+                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                xEventGroupSetBitsFromISR( xEventGroup, uxBits, &xHigherPriorityTaskWoken );
+                portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+            }
+        }
+        else
+        {
+            __sev();
+            #if ( configNUMBER_OF_CORES == 1 )
+                if( pxCrossCoreSpinLock != pxLock->spin_lock )
+                {
+                    spin_lock_unsafe_blocking( pxCrossCoreSpinLock );
+                    uxCrossCoreEventBits |= uxBits;
+                    spin_unlock_unsafe( pxCrossCoreSpinLock );
+                }
+                else
+                {
+                    uxCrossCoreEventBits |= uxBits;
+                }
+
+                /* This causes doorbell irq on the other (FreeRTOS) core which will do the set the event bits */
+                if ( cDoorbellNum >= 0 )
+                {
+                    multicore_doorbell_set_other_core(cDoorbellNum);
+                }
+            #endif /* configNUMBER_OF_CORES == 1 */
+            spin_unlock( pxLock->spin_lock, ulSave );
+        }
+    }
+
+    bool xPortLockInternalSpinUnlockWithBestEffortWaitOrTimeout( struct lock_core * pxLock,
+                                                                 uint32_t ulSave,
+                                                                 absolute_time_t uxUntil )
+    {
+        configASSERT( !portCHECK_IF_IN_ISR() );
+        configASSERT( pxLock->spin_lock );
+
+        /* note no need to check LIB_PICO_MULTICORE, as this is always returns true if that is not defined */
+        if( !portIS_FREE_RTOS_CORE() )
+        {
+            spin_unlock( pxLock->spin_lock, ulSave );
+            return best_effort_wfe_or_timeout( uxUntil );
+        }
+        else
+        {
+            configASSERT( portIS_FREE_RTOS_CORE() );
+
+            TickType_t uxTicksToWait = prvGetTicksToWaitBefore( uxUntil );
+
+            if( uxTicksToWait )
+            {
+                /* See comment in vPortLockInternalSpinUnlockWithWait for detail
+                 * about possible race conditions */
+                spin_unlock( pxLock->spin_lock, ulSave );
+                xEventGroupWaitBits( xEventGroup,
+                                     prvGetEventGroupBit( pxLock->spin_lock ), pdTRUE,
+                                     pdFALSE, uxTicksToWait );
+            }
+            else
+            {
+                spin_unlock( pxLock->spin_lock, ulSave );
+            }
+
+            if( time_reached( uxUntil ) )
+            {
+                return true;
+            }
+            else
+            {
+                /* We do not want to hog the core */
+                portYIELD();
+                /* We aren't sure if we've reached the timeout yet; the caller will check */
+                return false;
+            }
+        }
+    }
+
+    #if ( configSUPPORT_PICO_SYNC_INTEROP == 1 )
+        /* runs before main */
+        static void __attribute__( ( constructor ) ) prvRuntimeInitializer( void )
+        {
+            /* This must be done even before the scheduler is started, as the spin lock
+             * is used by the overrides of the SDK wait/notify primitives */
+            #if ( configNUMBER_OF_CORES == 1 )
+                pxCrossCoreSpinLock = spin_lock_instance( next_striped_spin_lock_num() );
+            #endif /* configNUMBER_OF_CORES == 1 */
+
+            /* The event group is not used prior to scheduler init, but is initialized
+             * here to since it logically belongs with the spin lock */
+            #if ( configSUPPORT_STATIC_ALLOCATION == 1 )
+                xEventGroup = xEventGroupCreateStatic( &xStaticEventGroup );
+            #else
+
+                /* Note that it is slightly dubious calling this here before the scheduler is initialized,
+                 * however the only thing it touches is the allocator which then calls vPortEnterCritical
+                 * and vPortExitCritical, and allocating here saves us checking the one time initialized variable in
+                 * some rather critical code paths */
+                xEventGroup = xEventGroupCreate();
+            #endif /* configSUPPORT_STATIC_ALLOCATION */
+        }
+    #endif /* if ( configSUPPORT_PICO_SYNC_INTEROP == 1 ) */
+#endif /* configSUPPORT_PICO_SYNC_INTEROP */
+
+#if ( configSUPPORT_PICO_TIME_INTEROP == 1 )
+    void xPortSyncInternalYieldUntilBefore( absolute_time_t t )
+    {
+        TickType_t uxTicksToWait = prvGetTicksToWaitBefore( t );
+
+        if( uxTicksToWait )
+        {
+            vTaskDelay( uxTicksToWait );
+        }
+    }
+#endif /* configSUPPORT_PICO_TIME_INTEROP */
+
+/*-----------------------------------------------------------*/
+
+#if ( configNUMBER_OF_CORES != 1 )
+    void vYieldCore( int xCoreID )
+    {
+        /* Remove warning if configASSERT is not defined.
+         * xCoreID is not used in this function due to this is a dual-core system. The yielding core must be different from the current core. */
+        ( void ) xCoreID;
+
+        configASSERT( xCoreID != ( int ) portGET_CORE_ID() );
+
+    #if ( configNUMBER_OF_CORES != 1 )
+
+        /* will cause interrupt on other core if not already pending */
+        configASSERT( cDoorbellNum >= 0);
+        multicore_doorbell_set_other_core(cDoorbellNum);
+    #endif
+    }
+#endif // ( configNUMBER_OF_CORES != 1 )
+
 /*-----------------------------------------------------------*/

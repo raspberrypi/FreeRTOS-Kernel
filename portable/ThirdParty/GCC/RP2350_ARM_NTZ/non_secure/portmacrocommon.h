@@ -460,7 +460,7 @@ extern void vClearInterruptMask( uint32_t ulMask ) /* __attribute__(( naked )) P
 /* Select correct value of configUSE_PORT_OPTIMISED_TASK_SELECTION
  * based on whether or not Mainline extension is implemented. */
 #ifndef configUSE_PORT_OPTIMISED_TASK_SELECTION
-    #if ( portHAS_ARMV8M_MAIN_EXTENSION == 1 )
+    #if ( portHAS_ARMV8M_MAIN_EXTENSION == 1 && !( configNUMBER_OF_CORES > 1 ))
         #define configUSE_PORT_OPTIMISED_TASK_SELECTION    1
     #else
         #define configUSE_PORT_OPTIMISED_TASK_SELECTION    0
