@@ -59,6 +59,7 @@
  */
 #if ( LIB_PICO_MULTICORE == 1 )
 #include "pico/multicore.h"
+#include "pico/runtime_init.h"
 #endif /* LIB_PICO_MULTICORE */
 
 #undef MPU_WRAPPERS_INCLUDED_FROM_API_FILE
@@ -1886,6 +1887,20 @@ void vPortSVCHandler_C( uint32_t * pulCallerStackAddress ) /* PRIVILEGED_FUNCTIO
     static void prvDisableInterruptsAndPortStartSchedulerOnCore( void )
     {
         portDISABLE_INTERRUPTS();
+
+        /* LOCAL PATCH (not upstream): this is the raw entry point core 1 is
+         * launched with via multicore_launch_core1() a few lines below, which
+         * bypasses the Pico SDK's normal per-core boot sequence. That sequence
+         * is what calls runtime_init_per_core_enable_coprocessors() to enable
+         * FPU access (CPACR) - without it, core 1 never gets FPU access
+         * enabled. Any task later context-switched (PendSV) while running on
+         * core 1 after having touched FPU registers then hits a NOCP
+         * UsageFault escalated to HardFault, which is silent/unrecoverable in
+         * this build (isr_hardfault is an unhandled breakpoint). Confirmed
+         * via SWD/GDB: CFSR=0x80000 (UFSR NOCP), HFSR=0x40000000 (FORCED),
+         * faulting in PendSV_Handler's FPU context save. */
+        runtime_init_per_core_enable_coprocessors();
+
         xPortStartSchedulerOnCore();
     }
 
