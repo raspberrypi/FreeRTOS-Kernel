@@ -343,7 +343,7 @@ dispatch_irq:
     add a1, a1, a0
     lw a1, %lo(__soft_vector_table)(a1)
     jalr ra, a1
-    // note: beware: freertos_risc_v_mtimer_interrupt_handler trashes s0 and s1, but
+    // note: beware: freertos_risc_v_mtimer_interrupt_handler trashes s0, s1 and s3, but
     // we require s2, s10, s11 saved.
 
 #if portcontextALLOW_NESTED_IRQs
@@ -365,8 +365,8 @@ no_more_irqs:
 .section .time_critical.freertos_risc_v_mtimer_interrupt_handler
 freertos_risc_v_mtimer_interrupt_handler:
     // we know we are called from freertos_risc_v_interrupt_handler which saves ALL registers
-    // already, and doesn't care about us trashing s0, so we used it instead of stack
-    // to save ra across the calls in this function
+    // already, and doesn't care about us trashing s0, s1 or s3, so we use them instead
+    // of stack to preserve values across the calls in this function
 
     mv   s0, ra
 
@@ -382,12 +382,13 @@ freertos_risc_v_mtimer_interrupt_handler:
 
     call callTaskEnterCriticalFromISR
 
-    // we are also allowed to trash s1 by the caller
+    // we are also allowed to trash s1 and s3 by the caller
     mv s1, a0
     call xTaskIncrementTick
+    mv s3, a0
     mv a0, s1
     call callTaskExitCriticalFromISR
-    beqz a0, exit_without_context_switch    /* Don't switch context if incrementing tick didn't unblock a task. */
+    beqz s3, exit_without_context_switch    /* Don't switch context if incrementing tick didn't unblock a task. */
 
 #if configNUMBER_OF_CORES != 1
     portcontextGET_CORE_ID a0 // vtTaskSwitch context takes coreID in SMP
